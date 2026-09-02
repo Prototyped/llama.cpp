@@ -898,6 +898,12 @@ struct ggml_metal_device {
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
+
+    // MoE expert-streaming servicer; see ggml_metal_device_set_moe_servicer
+    ggml_metal_moe_servicer_t moe_servicer;
+    void *                    moe_servicer_ud;
+    ggml_metal_event_t        moe_event;
+    atomic_ullong             moe_value;
 };
 
 //
@@ -1350,6 +1356,11 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
     @autoreleasepool {
         ggml_metal_rsets_free(dev->rsets);
 
+        if (dev->moe_event) {
+            ggml_metal_device_event_free(dev, dev->moe_event);
+            dev->moe_event = NULL;
+        }
+
         ggml_metal_library_free(dev->library);
         dev->library = NULL;
 
@@ -1436,6 +1447,101 @@ void ggml_metal_event_encode_wait(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cm
 
     [cmd_buf encodeWaitForEvent:event value:atomic_load_explicit(&ev->value, memory_order_relaxed)];
 }
+
+void ggml_metal_event_encode_signal_value(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw, uint64_t value) {
+    [(id<MTLCommandBuffer>) cmd_buf_raw encodeSignalEvent:(id<MTLSharedEvent>)ev->obj value:value];
+}
+
+void ggml_metal_event_encode_wait_value(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw, uint64_t value) {
+    [(id<MTLCommandBuffer>) cmd_buf_raw encodeWaitForEvent:(id<MTLSharedEvent>)ev->obj value:value];
+}
+
+void ggml_metal_event_signal_cpu(ggml_metal_event_t ev, uint64_t value) {
+    ((id<MTLSharedEvent>)ev->obj).signaledValue = value;
+}
+
+uint64_t ggml_metal_event_value(ggml_metal_event_t ev) {
+    return ((id<MTLSharedEvent>)ev->obj).signaledValue;
+}
+
+static MTLSharedEventListener * ggml_metal_event_listener(void) {
+    // one private serial queue for every notification; the servicer must not block it
+    static MTLSharedEventListener * g_listener = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_queue_t q = dispatch_queue_create("ggml-metal-event", DISPATCH_QUEUE_SERIAL);
+        g_listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:q];
+    });
+    return g_listener;
+}
+
+void ggml_metal_event_notify(ggml_metal_event_t ev, uint64_t value, void (*cb)(void *, uint64_t), void * user_data) {
+    [(id<MTLSharedEvent>)ev->obj notifyListener:ggml_metal_event_listener()
+                                        atValue:value
+                                          block:^(id<MTLSharedEvent> e, uint64_t v) {
+        GGML_UNUSED(e);
+        cb(user_data, v);
+    }];
+}
+
+void ggml_metal_device_set_moe_servicer(ggml_metal_device_t dev, ggml_metal_moe_servicer_t fn, void * user_data) {
+    dev->moe_servicer    = fn;
+    dev->moe_servicer_ud = user_data;
+
+    if (fn && dev->moe_event == NULL) {
+        dev->moe_event = ggml_metal_device_event_init(dev);
+        atomic_store(&dev->moe_value, 1);
+    }
+}
+
+bool ggml_metal_device_has_moe_servicer(ggml_metal_device_t dev) {
+    return dev->moe_servicer != NULL && dev->moe_event != NULL;
+}
+
+struct ggml_metal_moe_req {
+    ggml_metal_device_t dev;
+    void *              state_host;
+    int32_t             layer;
+    uint64_t            reply;
+};
+
+static void ggml_metal_moe_cb(void * ud, uint64_t v) {
+    GGML_UNUSED(v);
+
+    struct ggml_metal_moe_req * r = (struct ggml_metal_moe_req *) ud;
+
+    // the servicer must never be allowed to skip the reply: the GPU is blocked on it and a missed
+    // signal hangs the command buffer for good
+    if (r->dev->moe_servicer) {
+        r->dev->moe_servicer(r->dev->moe_servicer_ud, r->state_host, r->layer);
+    }
+
+    ggml_metal_event_signal_cpu(r->dev->moe_event, r->reply);
+
+    free(r);
+}
+
+ggml_metal_event_t ggml_metal_device_moe_handshake(ggml_metal_device_t dev, void * state_host, int32_t layer, uint64_t * value) {
+    if (!ggml_metal_device_has_moe_servicer(dev)) {
+        return NULL;
+    }
+
+    const uint64_t v = atomic_fetch_add(&dev->moe_value, 2);
+
+    struct ggml_metal_moe_req * r = (struct ggml_metal_moe_req *) malloc(sizeof(struct ggml_metal_moe_req));
+    r->dev        = dev;
+    r->state_host = state_host;
+    r->layer      = layer;
+    r->reply      = v + 1;
+
+    // registered before the command buffer is committed, so the signal cannot be missed
+    ggml_metal_event_notify(dev->moe_event, v, ggml_metal_moe_cb, r);
+
+    *value = v;
+
+    return dev->moe_event;
+}
+
 
 ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev) {
     id<MTLSharedEvent> event = [dev->mtl_device newSharedEvent];
@@ -1694,6 +1800,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_LEAKY_RELU:
             return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
+        case GGML_OP_MOE_SLOT_RESOLVE:
+            return op->type == GGML_TYPE_I32 &&
+                   op->src[0]->type == GGML_TYPE_I32 &&
+                   op->src[1]->type == GGML_TYPE_I32;
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_ARANGE:
