@@ -118,7 +118,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
-            || arch == LLM_ARCH_MISTRAL4) {
+            || arch == LLM_ARCH_MISTRAL4
+            || arch == LLM_ARCH_GLM5NEXT
+            || arch == LLM_ARCH_HY_V4) {
         n_embd = 128;
         n_head = 1;
         n_ff   = 192;
@@ -174,6 +176,16 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         }
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
+    } else if (arch == LLM_ARCH_GLM5NEXT) {
+        // head_count doubles as the KDA head count; the kv array marks the recurrent layers
+        GGML_ASSERT(n_layer >= 2);
+        std::vector<uint32_t> n_head_kv_per_layer;
+        n_head_kv_per_layer.reserve(n_layer);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            n_head_kv_per_layer.push_back(il == 1 ? 0 : n_head_kv);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,    n_head);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(1) : n_head_kv);
@@ -191,7 +203,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
-            || arch == LLM_ARCH_MISTRAL4) {
+            || arch == LLM_ARCH_MISTRAL4
+            || arch == LLM_ARCH_HY_V4) {
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(576));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
@@ -213,12 +226,20 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             }
             ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
         }
+    } else if (arch == LLM_ARCH_GLM5NEXT) {
+        // nope-only MLA: the cache holds the bare latent, so n_rot must be an explicit 0
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(512));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(0));
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
     } else if (arch == LLM_ARCH_MINIMAX_M3) {
         // partial rotary: n_rot must not exceed the indexer key length (64)
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
     }
     ms.add_kv(LLM_KV_ATTENTION_CLAMP_KQV,              1.0f);
-    ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,          1e-5f);
+    // glm5next warns on anything but the 1e-6 its indexer k_norm hardcodes
+    ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,          arch == LLM_ARCH_GLM5NEXT ? 1e-6f : 1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,      1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_EPS,          1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_GROUPS,       uint32_t(8));
@@ -235,7 +256,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
         // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
-    } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 ||
+    } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_SPARK2_5 ||
             arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE) {
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
@@ -291,6 +312,22 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
 
+    if (arch == LLM_ARCH_HY_V4) {
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,     uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,   1.0e-6f);
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_MAGNITUDE, 2.0f);
+        ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,           10.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,       1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,        true);
+        // layer 0 must own an indexer, the odd layers share it
+        std::vector<uint32_t> indexer_types;
+        indexer_types.reserve(n_layer);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            indexer_types.push_back(il % 2 ? 0 : 1);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
+    }
+
     if (arch == LLM_ARCH_DEEPSEEK4) {
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,         uint32_t(8));
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,           uint32_t(32));
@@ -303,6 +340,16 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                      10.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                  1.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                   true);
+    } else if (arch == LLM_ARCH_GLM5NEXT) {
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               uint32_t(4)); // build_hc_pre asserts exactly 4 streams
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             1.0e-6f);
+        // the only arch that pools indexer keys; top_k must be a whole number of pools and the
+        // selection width must stay under n_ctx or the sparse path goes unused
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL,              uint32_t(4));
+        // glm5next reads these unconditionally; the if (moe) block below never sets them
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                 1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                  true);
     }
     ms.add_kv(LLM_KV_TOKENIZER_MODEL,         "no_vocab");
     // ms.add_kv(LLM_KV_DENSE_2_FEAT_OUT,     n_embd);
@@ -458,6 +505,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
+        case LLM_ARCH_GLM5NEXT:
         case LLM_ARCH_EXAONE_MOE:
         case LLM_ARCH_BAILINGMOE:
         case LLM_ARCH_BAILINGMOE2:
@@ -468,6 +516,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_ERNIE4_5_MOE:
         case LLM_ARCH_HUNYUAN_MOE:
         case LLM_ARCH_HY_V3:
+        case LLM_ARCH_HY_V4:
         case LLM_ARCH_OPENAI_MOE:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_SMALLTHINKER:
