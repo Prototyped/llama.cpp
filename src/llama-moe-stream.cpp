@@ -1649,13 +1649,34 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
 
     // a small final wave has fewer than n_ids own slots; borrow the rest from the previous wave's
     //   pool so every token row has n_ids distinct resident parking slots for its masked pairs
+    //
+    // the previous pool is not necessarily disjoint from this wave's demand: on wave 0 of a new
+    // ubatch it still holds the previous ubatch's last pool, and an expert routed again is a cache
+    // hit whose slot would land in both demand_slots and borrowed - a duplicate that leaves
+    // emit_wave_slots short of n_ids distinct parking slots. skip any slot this wave re-uses as a hit
     std::vector<int32_t> borrowed;
     if (count < n_ids) {
-        GGML_ASSERT(sl.plan_pool.size() >= n_ids - count);
-        for (size_t i = 0; i < n_ids - count; i++) {
-            borrowed.push_back(sl.plan_pool[i]);
-            sl.keep[sl.plan_pool[i]] = 1; // parking slots must survive this wave's loads
+        std::vector<uint8_t> hit_slot(sl.n_slots, 0);
+        for (size_t i = first; i < first + count; i++) {
+            const auto it = sl.expert_slot.find(sl.uniq[i]);
+            if (it != sl.expert_slot.end()) {
+                hit_slot[it->second] = 1;
+            }
         }
+
+        size_t need = n_ids - count;
+        for (size_t i = 0; i < sl.plan_pool.size() && need > 0; i++) {
+            const int32_t s = sl.plan_pool[i];
+            if (hit_slot[s]) {
+                continue;
+            }
+            borrowed.push_back(s);
+            sl.keep[s] = 1; // parking slots must survive this wave's loads
+            need--;
+        }
+        // the previous pool has at least n_ids distinct slots and at most count collide with this
+        //   wave's demand, so the walk above always finds the required n_ids - count
+        GGML_ASSERT(need == 0);
     }
 
     // protect the next wave's already-resident experts so this wave's victims do not evict them.
@@ -1789,6 +1810,11 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
     //   the next same-layer reservation is ordered after this wave's GEMMs by the graph)
     sl.plan_pool = sl.demand_slots;
     sl.plan_pool.insert(sl.plan_pool.end(), borrowed.begin(), borrowed.end());
+
+    // emit_wave_slots needs n_ids DISTINCT resident parking slots per token row (the Metal kernel
+    //   repeats a slot at most once per row). distinctness holds by construction: demand_slots is
+    //   one slot per distinct expert, borrowed skips this wave's hit slots, and pick_victim honors
+    //   keep, so no MISS reservation can land on a borrowed slot
     GGML_ASSERT(sl.plan_pool.size() >= n_ids);
 }
 
