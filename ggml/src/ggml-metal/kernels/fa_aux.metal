@@ -477,3 +477,139 @@ template [[host_name("kernel_lightning_indexer_q4_1")]] kernel kernel_lightning_
 template [[host_name("kernel_lightning_indexer_q5_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_lightning_indexer_q5_1")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_lightning_indexer_q8_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q8_0, 2, dequantize_q8_0>;
+
+
+// ---------------------------------------------------------------------------------------------
+// GGML_OP_UNION_BUILD - union-8 support.
+//
+// One threadgroup per BLOCK of queries. Instead of sorting 8*n_sel ids (PLAN's bitonic + 8-way
+// merge), build a bitmap over the pooled rows. Scanning it in order yields a naturally ascending
+// union with no sort.
+//
+// Membership then needs no search either - the union index of a row is its rank in the bitmap:
+//     idx = wordbase[id/32] + popcount(bitmap[id/32] & ((1<<(id%32)) - 1))
+// and because every query that selected a row writes the SAME id there, a single atomic_or of
+// ((1<<(24+q)) | id) packs the id and the 8-bit membership mask into one word.
+//
+// max_union is block*n_sel, so the union can never overflow and no selection is ever dropped -
+// dropping one would silently change attention output.
+//
+// The bitmap is a fixed 2048 words, but n_csa is NOT bounded by it: the row space is walked in
+// chunks of 2048*32 rows, carrying the union offset across chunks. Chunks are visited in
+// increasing row order and ids ascend within a chunk, so the union stays globally ascending.
+// This is what lets the path stay on past 65536 CSA rows - it used to switch itself off there,
+// silently falling back to dense attention exactly at the long contexts it was built for.
+#define UNION_BUILD_MAX_WORDS 2048   // rows per chunk = 65536 (8 KB bitmap + 8 KB wordbase)
+
+kernel void kernel_union_build(
+        constant ggml_metal_kargs_union_build & args,
+        device const char * sel,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3 ntg3 [[threads_per_threadgroup]]) {
+    const short ntg = (short) ntg3.x;
+
+    threadgroup atomic_uint bitmap  [UNION_BUILD_MAX_WORDS];
+    threadgroup uint        wordbase[UNION_BUILD_MAX_WORDS];
+
+    // union entries emitted by the chunks already done, and whether this chunk marked anything
+    threadgroup uint         gbase;
+    threadgroup atomic_uint  hit;
+
+    const int ib = tgpig.x;
+
+    device int32_t * out = (device int32_t *) (dst + ib*args.nb1);
+
+    for (int i = tiitg; i < args.max_union + 1; i += ntg) {
+        out[i] = 0;
+    }
+
+    if (tiitg == 0) {
+        gbase = 0;
+    }
+
+    // Order device-memory zeroing before other lanes atomically OR membership into the output.
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+    const int n_this      = min((int) args.block, args.n_tokens - ib*args.block);
+    const int chunk_rows  = UNION_BUILD_MAX_WORDS*32;
+
+    for (int base = 0; base < args.n_csa; base += chunk_rows) {
+        const int rows   = min(chunk_rows, args.n_csa - base);
+        const int nwords = (rows + 31)/32;
+
+        for (int i = tiitg; i < nwords; i += ntg) {
+            atomic_store_explicit(&bitmap[i], 0u, memory_order_relaxed);
+        }
+        if (tiitg == 0) {
+            atomic_store_explicit(&hit, 0u, memory_order_relaxed);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // pass A: mark every selected row that falls in this chunk
+        for (int i = tiitg; i < n_this*args.n_sel; i += ntg) {
+            const int q = i/args.n_sel;
+            const int j = i%args.n_sel;
+
+            device const int32_t * srow = (device const int32_t *) (sel + (ib*args.block + q)*args.nbs1);
+
+            const int id = srow[j] - base;
+            if (id >= 0 && id < rows) {
+                atomic_fetch_or_explicit(&bitmap[id >> 5], 1u << (id & 31), memory_order_relaxed);
+                atomic_store_explicit(&hit, 1u, memory_order_relaxed); // every lane stores the same value
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // a chunk no query selected from contributes nothing: skip its prefix sum, which is the
+        // serial part, and its second pass over the selections
+        if (atomic_load_explicit(&hit, memory_order_relaxed) == 0u) {
+            continue;
+        }
+
+        // exclusive prefix sum of per-word popcounts, continuing from the previous chunk (serial
+        // over words in one thread; it runs once per chunk per block, against an attention op that
+        // is orders of magnitude larger)
+        if (tiitg == 0) {
+            uint acc = gbase;
+            for (int w = 0; w < nwords; ++w) {
+                wordbase[w] = acc;
+                acc += popcount(atomic_load_explicit(&bitmap[w], memory_order_relaxed));
+            }
+            gbase = acc;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // pass B: rank each selection into its union slot and OR in the membership bit
+        for (int i = tiitg; i < n_this*args.n_sel; i += ntg) {
+            const int q = i/args.n_sel;
+            const int j = i%args.n_sel;
+
+            device const int32_t * srow = (device const int32_t *) (sel + (ib*args.block + q)*args.nbs1);
+
+            const int id = srow[j] - base;
+            if (id < 0 || id >= rows) {
+                continue;
+            }
+
+            const uint w     = id >> 5;
+            const uint bit   = id & 31;
+            const uint below = atomic_load_explicit(&bitmap[w], memory_order_relaxed) & ((1u << bit) - 1u);
+            const uint idx   = wordbase[w] + popcount(below);
+
+            device atomic_uint * slot = (device atomic_uint *) &out[idx];
+            atomic_fetch_or_explicit(slot, (1u << (24 + q)) | (uint) (id + base), memory_order_relaxed);
+        }
+
+        // the next chunk rewrites bitmap and wordbase, so pass B must be done reading them
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tiitg == 0) {
+        out[args.max_union] = (int32_t) gbase;
+    }
+}
