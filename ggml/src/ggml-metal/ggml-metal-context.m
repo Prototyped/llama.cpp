@@ -11,6 +11,8 @@
 #import <Foundation/Foundation.h>
 
 #import <Metal/Metal.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #undef MIN
 #undef MAX
@@ -43,6 +45,14 @@ struct ggml_metal {
     int debug_graph;
 
     struct ggml_metal_fusion_info * finfo;
+
+    // GGML_METAL_GPU_PROFILE: total GPU busy time of this context's command buffers, from Metal's
+    // own GPUStartTime/GPUEndTime. One llama_context gets one Metal context, so with speculative
+    // decoding the target and the draft model report separately - which is the point.
+    bool     gpu_profile;
+    dispatch_group_t prof_group;
+    _Atomic  uint64_t prof_gpu_ns;
+    _Atomic  uint64_t prof_cmd_bufs;
 
     // capture state
     int capture_compute;
@@ -144,6 +154,13 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
             res->debug_graph = val ? atoi(val) : 0;
         }
 
+        {
+            res->gpu_profile = ggml_metal_positive_env("GGML_METAL_GPU_PROFILE") > 0;
+            res->prof_group = res->gpu_profile ? dispatch_group_create() : NULL;
+            atomic_store(&res->prof_gpu_ns, 0);
+            atomic_store(&res->prof_cmd_bufs, 0);
+        }
+
         res->use_graph_optimize = true;
 
         if (getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") != NULL) {
@@ -190,8 +207,49 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     }
 }
 
+// GGML_METAL_GPU_PROFILE: accumulate a command buffer's GPU busy time once it completes.
+// GPUEndTime/GPUStartTime are Metal's own GPU-side clock, so this measures execution, not the wall
+// time the CPU spent waiting. Only the graph-compute buffers are instrumented - the tensor get/set
+// buffers are not part of the model's compute.
+static void ggml_metal_prof_track(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf) {
+    if (!ctx->gpu_profile) {
+        return;
+    }
+
+    dispatch_group_enter(ctx->prof_group);
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        const double dt = [cb GPUEndTime] - [cb GPUStartTime];
+        if (dt > 0.0) {
+            atomic_fetch_add(&ctx->prof_gpu_ns, (uint64_t)(dt*1e9));
+            atomic_fetch_add(&ctx->prof_cmd_bufs, 1);
+        }
+        dispatch_group_leave(ctx->prof_group);
+    }];
+}
+
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
+
+    if (ctx->gpu_profile || ggml_metal_kprof_stride() > 0) {
+        ggml_metal_synchronize(ctx);
+        ggml_metal_kprof_flush();
+    }
+
+    if (ctx->gpu_profile) {
+        dispatch_group_wait(ctx->prof_group, DISPATCH_TIME_FOREVER);
+
+        const uint64_t ns = atomic_load(&ctx->prof_gpu_ns);
+        const uint64_t nb = atomic_load(&ctx->prof_cmd_bufs);
+        // straight to stderr as well as the log: ggml_metal_free runs during teardown, after the
+        // CLI has already dropped its log callback, so the logged copy would be discarded
+        fprintf(stderr, "GPU PROFILE: %8.3f s accumulated over %6llu command buffers (%.3f ms each)\n",
+                ns/1e9, (unsigned long long) nb, nb ? ns/1e6/nb : 0.0);
+        fflush(stderr);
+        GGML_LOG_WARN("%s: GPU PROFILE: %8.3f s accumulated over %6llu command buffers (%.3f ms each)\n",
+                __func__, ns/1e9, (unsigned long long) nb, nb ? ns/1e6/nb : 0.0);
+
+        dispatch_release(ctx->prof_group);
+    }
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
@@ -276,6 +334,10 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             }
         }
     }
+
+    // GGML_METAL_KPROF: every command buffer of the graph has completed, so the counter sample
+    // buffers recorded during encoding can now be resolved
+    ggml_metal_kprof_flush();
 
     // release any completed extra command buffers
     if (ctx->cmd_bufs_ext.count > 0) {
@@ -455,7 +517,78 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+static void ggml_metal_kprof_print_json_string(const char * value, size_t length) {
+    fputc('"', stderr);
+    for (size_t i = 0; i < length; ++i) {
+        const unsigned char c = value[i];
+        switch (c) {
+            case '"':  fputs("\\\"", stderr); break;
+            case '\\': fputs("\\\\", stderr); break;
+            case '\b': fputs("\\b",  stderr); break;
+            case '\f': fputs("\\f",  stderr); break;
+            case '\n': fputs("\\n",  stderr); break;
+            case '\r': fputs("\\r",  stderr); break;
+            case '\t': fputs("\\t",  stderr); break;
+            default:
+                if (c < 0x20) {
+                    fprintf(stderr, "\\u%04x", (unsigned int) c);
+                } else {
+                    fputc(c, stderr);
+                }
+                break;
+        }
+    }
+    fputc('"', stderr);
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    // GGML_METAL_KPROF: KPROF records carry raw node indices, so dump each distinct graph map once.
+    // The KPROFS marker ties each later flush to the graph that produced it - stderr writes from
+    // here and from synchronize() are both on the calling thread, so log order is exact.
+    if (ggml_metal_kprof_stride() > 0) {
+        static pthread_mutex_t kprof_map_mutex = PTHREAD_MUTEX_INITIALIZER;
+        static uint64_t kprof_dumped_keys[256] = { 0 };
+        static int kprof_n_dumped = 0;
+        const uint64_t key = ggml_metal_kprof_graph_key(gf);
+
+        pthread_mutex_lock(&kprof_map_mutex);
+        flockfile(stderr);
+
+        fprintf(stderr, "KPROFS {\"uid\":%llu,\"key\":%llu,\"n_nodes\":%d,\"n_cb\":%d}\n",
+                (unsigned long long) gf->uid, (unsigned long long) key, gf->n_nodes, ctx->n_cb);
+
+        bool dumped = false;
+        for (int i = 0; i < kprof_n_dumped; ++i) {
+            if (kprof_dumped_keys[i] == key) {
+                dumped = true;
+                break;
+            }
+        }
+
+        if (!dumped) {
+            if (kprof_n_dumped < 256) {
+                kprof_dumped_keys[kprof_n_dumped++] = key;
+            }
+
+            for (int i = 0; i < gf->n_nodes; ++i) {
+                const struct ggml_tensor * n = gf->nodes[i];
+                const char * op_desc = ggml_op_desc(n);
+
+                fprintf(stderr, "KPROFN {\"uid\":%llu,\"key\":%llu,\"node\":%d,\"op\":",
+                        (unsigned long long) gf->uid, (unsigned long long) key, i);
+                ggml_metal_kprof_print_json_string(op_desc, strlen(op_desc));
+                fputs(",\"name\":", stderr);
+                ggml_metal_kprof_print_json_string(n->name, strnlen(n->name, GGML_MAX_NAME));
+                fprintf(stderr, ",\"ne\":[%lld,%lld,%lld,%lld]}\n",
+                        (long long) n->ne[0], (long long) n->ne[1],
+                        (long long) n->ne[2], (long long) n->ne[3]);
+            }
+        }
+
+        funlockfile(stderr);
+        pthread_mutex_unlock(&kprof_map_mutex);
+    }
+
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
@@ -748,6 +881,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         ggml_metal_op_free(ctx_op);
 
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
+            ggml_metal_prof_track(ctx, cmd_buf);
             [cmd_buf commit];
         }
     });
