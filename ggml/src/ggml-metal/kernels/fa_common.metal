@@ -6,6 +6,10 @@ constant bool FC_flash_attn_ext_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT 
 
 constant bool FC_flash_attn_ext_bc_mask [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
 
+// union entries also read the mask (ggml_flash_attn_union_mask_all); unset, and so false, elsewhere
+constant bool FC_flash_attn_ext_union_mask_fc [[function_constant(FC_FLASH_ATTN_EXT + 5)]];
+constant bool FC_flash_attn_ext_union_mask = is_function_constant_defined(FC_flash_attn_ext_union_mask_fc) ? FC_flash_attn_ext_union_mask_fc : false;
+
 //constant float FC_flash_attn_ext_scale         [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
 //constant float FC_flash_attn_ext_max_bias      [[function_constant(FC_FLASH_ATTN_EXT + 11)]];
 //constant float FC_flash_attn_ext_logit_softcap [[function_constant(FC_FLASH_ATTN_EXT + 12)]];
@@ -44,7 +48,8 @@ template<
     short DV,         // V head size
     short Q,          // queries per threadgroup
     short C,          // cache items per threadgroup
-    short NSG>        // number of simd groups
+    short NSG,        // number of simd groups
+    bool  UNION = false> // union-8: walk a per-block union list instead of the whole KV range
 void kernel_flash_attn_ext_impl(
         constant ggml_metal_kargs_flash_attn_ext & args,
         device const char * q,
@@ -54,6 +59,7 @@ void kernel_flash_attn_ext_impl(
         device const char * sinks,
         device const char * pad,
         device const char * blk,
+        device const char * uids,
         device       char * dst,
         threadgroup  half * shmem_f16,
         uint3   tgpig,
@@ -186,11 +192,35 @@ void kernel_flash_attn_ext_impl(
             slope = pow(base, exph);
         }
 
+        // union-8: this Q-block's union list. Each entry packs the pooled row id in the low 24
+        // bits and an 8-bit membership mask in the high byte; the last element is the length.
+        device const int32_t * ublk = nullptr;
+        int ulen = 0;
+
+        if (UNION) {
+            ublk = (device const int32_t *) (uids + (iq1/Q)*args.nbu1);
+            ulen = ublk[args.max_union];
+        }
+
+        // chunks: the contiguous dense prefix [0, n_dense) first, then the union region. The
+        // prefix MUST stay contiguous - routing it through the staged path costs more than the
+        // union saves (measured: 2950 vs 1730 arbitrary units at n_csa=8192).
+        const int nc_dense = UNION ? (args.n_dense + C - 1)/C : 0;
+        const int nc_union = UNION ? (ulen         + C - 1)/C : 0;
+
         // loop over the KV cache
         // each simdgroup handles blocks of Q rows and C columns
         for (int ic0 = 0; ; ++ic0) {
-            int ic = ic0*C;
-            if (ic >= args.ne11) {
+            const bool u = UNION && ic0 >= nc_dense;
+
+            int ic = u ? 0 : ic0*C;
+            const int j0 = u ? (ic0 - nc_dense)*C : 0;
+
+            if (UNION) {
+                if (ic0 >= nc_dense + nc_union) {
+                    break;
+                }
+            } else if (ic >= args.ne11) {
                 break;
             }
 
@@ -236,21 +266,50 @@ void kernel_flash_attn_ext_impl(
 
             // read the mask into shared mem
             if (FC_flash_attn_ext_has_mask) {
-                blk_cur = blk[ic0];
+                // only the DENSE chunks consult the precomputed block-skip table; a union chunk
+                // always has at least one query attending it, by construction
+                if (!UNION) {
+                    blk_cur = blk[ic0];
 
-                if (blk_cur == 0) {
-                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-                        pm2[jj] += NW;
+                    if (blk_cur == 0) {
+                        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                            pm2[jj] += NW;
+                        }
+
+                        continue;
                     }
-
-                    continue;
                 }
 
-                if (blk_cur == 1) {
+                if (u) {
+                    // union chunk: the mask IS the membership byte - query j attends union slot i
+                    // only if bit j is set. Slots past ulen are padding and are always masked.
                     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
                         const short j = jj*NSG + sgitg;
 
-                        if (FC_flash_attn_ext_bc_mask) {
+                        half2 mv(-MAXHALF, -MAXHALF);
+
+                        device const half * mrow = (device const half *) (mask + (iq1 + j)*args.nb31 +
+                                (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+
+                        FOR_UNROLL (short h = 0; h < 2; ++h) {
+                            const int i = j0 + 2*tiisg + h;
+                            if (i < ulen) {
+                                const uint packed = (uint) ublk[i];
+                                if (packed & (1u << (24 + j))) {
+                                    mv[h] = FC_flash_attn_ext_union_mask ? mrow[args.n_dense + (int) (packed & 0xFFFFFFu)] : 0.0h;
+                                }
+                            }
+                        }
+
+                        sm2[j*SH + tiisg] = mv;
+                    }
+                } else if (blk_cur == 1) {
+                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                        const short j = jj*NSG + sgitg;
+
+                        if (UNION && iq1 + j >= args.ne01) {
+                            sm2[j*SH + tiisg] = half2(-MAXHALF, -MAXHALF);
+                        } else if (FC_flash_attn_ext_bc_mask) {
                             sm2[j*SH + tiisg] = (iq1 + j) < args.ne31 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
                         } else {
                             sm2[j*SH + tiisg] = pm2[jj][tiisg];
@@ -264,6 +323,33 @@ void kernel_flash_attn_ext_impl(
                     }
                 }
 
+            }
+
+            // UNION mode has no precomputed blk table, so detect fully-masked PREFIX chunks at
+            // runtime from the mask just loaded. This is the same "-INF block" test the dense path
+            // replaced with blk. Without it the CAUSAL prefix costs ~2x what it should, and since
+            // the prefix is context-INDEPENDENT that penalty sets union's flat floor (~63 t/s).
+            // Union chunks are never skipped: by construction every union column is wanted by at
+            // least one query in the block.
+            if (UNION && !u) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                half2 smax2(-MAXHALF/2, -MAXHALF/2);
+
+                FOR_UNROLL (short j = 0; j < Q; ++j) {
+                    smax2 = max(smax2, sm2[j*SH + tiisg]);
+                }
+
+                smax2 = simd_max(smax2);
+
+                if (max(smax2[0], smax2[1]) <= -MAXHALF/2) {
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                    continue;
+                }
+            }
+
+            if (false) {
 #if 0
                 // note: old -INF block optimization - obsoleted by pre-computing non-masked blocks
 
@@ -290,7 +376,7 @@ void kernel_flash_attn_ext_impl(
 
             // Q*K^T
             // this is compile-time check, so it does not have runtime overhead
-            if (is_same<kd4x4_t, k4x4_t>::value) {
+            if (!u && is_same<kd4x4_t, k4x4_t>::value) {
                 // we can read directly from global memory
                 device      const k_t * pk = (device const k_t *) (k + ic*args.nb11);
                 threadgroup const q_t * pq = sq;
@@ -376,7 +462,12 @@ void kernel_flash_attn_ext_impl(
                     }
 
                     for (short ii = 0; ii < DK16; ii += 4) {
-                        device const kd4x4_t * pk4x4 = (device const kd4x4_t *) (k + ((ic + 8*cc + ty)*args.nb11));
+                        // k_all is concat(raw, csa): the union ids are CSA-relative, so they
+                        // index the tensor at n_dense + id
+                        const int kcol = u ? args.n_dense + (int) (((uint) ublk[min(j0 + 8*cc + ty, ulen - 1)]) & 0xFFFFFFu)
+                                          : (ic + 8*cc + ty);
+
+                        device const kd4x4_t * pk4x4 = (device const kd4x4_t *) (k + ((size_t) kcol)*args.nb11);
 
                         if (DK16%4 == 0) {
                             // the head is evenly divisible by 4*16 = 64, so no need for bound checks
@@ -488,7 +579,7 @@ void kernel_flash_attn_ext_impl(
             // O = O + (Q*K^T)*V
             {
                 // we can read directly from global memory
-                if (is_same<vd4x4_t, v4x4_t>::value) {
+                if (!u && is_same<vd4x4_t, v4x4_t>::value) {
                     static_assert(PV8 % NSG == 0, "");
 
                     constexpr short NO = PV8/NSG;
@@ -587,7 +678,10 @@ void kernel_flash_attn_ext_impl(
                         }
 
                         for (short ii = 4*sgitg; ii < DV16; ii += 4*NSG) {
-                            device const vd4x4_t * pv4x4 = (device const vd4x4_t *) (v + ((ic + 8*cc + ty)*args.nb21));
+                            const int vcol = u ? args.n_dense + (int) (((uint) ublk[min(j0 + 8*cc + ty, ulen - 1)]) & 0xFFFFFFu)
+                                              : (ic + 8*cc + ty);
+
+                            device const vd4x4_t * pv4x4 = (device const vd4x4_t *) (v + ((size_t) vcol)*args.nb21);
 
                             if (DV16%4 == 0) {
                                 // no need for bound checks
@@ -745,7 +839,7 @@ kernel void kernel_flash_attn_ext(
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
 #define FWD_TMPL(nq) q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, nq, C
-#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg
+#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, blk, dst, shmem_f16, tgpig, tiisg, sgitg
     switch (FC_flash_attn_ext_nsg) {
       // note: disabled cases to reduce library load time
       //case 1: kernel_flash_attn_ext_impl<FWD_TMPL(Q), 1>(FWD_ARGS); break;
@@ -762,4 +856,42 @@ kernel void kernel_flash_attn_ext(
     }
 #undef FWD_TMPL
 #undef FWD_ARGS
+}
+
+// union-8 entry point: same tuned kernel, but the sparse region walks a per-block union list with
+// index indirection and masks each query from the membership byte. The dense prefix [0, n_dense)
+// keeps the contiguous fast path.
+template<
+    typename q_t, typename q4_t, typename q8x8_t,
+    typename k_t, typename k4x4_t, typename k8x8_t,
+    typename v_t, typename v4x4_t, typename v8x8_t,
+    typename qk_t, typename qk8x8_t,
+    typename s_t, typename s2_t, typename s8x8_t,
+    typename o_t, typename o4_t, typename o8x8_t,
+    typename kd4x4_t, short nl_k, void (*deq_k)(device const kd4x4_t *, short, thread k4x4_t &),
+    typename vd4x4_t, short nl_v, void (*deq_v)(device const vd4x4_t *, short, thread v4x4_t &),
+    short DK, short DV, short Q, short C>
+kernel void kernel_flash_attn_ext_union(
+        constant ggml_metal_kargs_flash_attn_ext & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const char * sinks,
+        device const char * pad,
+        device const char * blk,
+        device const char * uids,
+        device       char * dst,
+        threadgroup  half * shmem_f16 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+#define UN_TMPL q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, Q, C
+#define UN_ARGS args, q, k, v, mask, sinks, pad, blk, uids, dst, shmem_f16, tgpig, tiisg, sgitg
+    switch (FC_flash_attn_ext_nsg) {
+        case 4: kernel_flash_attn_ext_impl<UN_TMPL, 4, true>(UN_ARGS); break;
+        case 8: kernel_flash_attn_ext_impl<UN_TMPL, 8, true>(UN_ARGS); break;
+    }
+#undef UN_TMPL
+#undef UN_ARGS
 }
