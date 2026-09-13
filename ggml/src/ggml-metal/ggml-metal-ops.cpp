@@ -2685,6 +2685,18 @@ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
     return ggml_type_size(GGML_TYPE_I32)*ne02*ne21;
 }
 
+size_t ggml_metal_op_mul_mat_id_extra_tiles(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_MUL_MAT_ID);
+
+    const int64_t ne02 = op->src[0]->ne[2]; // n_expert
+    const int64_t ne20 = op->src[2]->ne[0]; // n_expert_used
+    const int64_t ne21 = op->src[2]->ne[1]; // n_token
+
+    // count + one entry per used 32-token tile: each expert holds at most ne21 tokens and all experts
+    // together ne20*ne21, so sum(ceil(n_e/32)) <= ne20*ne21/32 + ne02
+    return ggml_type_size(GGML_TYPE_I32)*(1 + (ne20*ne21 + 31)/32 + ne02);
+}
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2736,6 +2748,12 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_buffer_id bid_ids = bid_tpe;
         bid_ids.offs += ggml_metal_op_mul_mat_id_extra_tpe(op);
 
+        ggml_metal_buffer_id bid_tiles = bid_ids;
+        bid_tiles.offs += ggml_metal_op_mul_mat_id_extra_ids(op);
+
+        // the tile index is packed in 16 bits
+        const bool compact = (ne21 + 31)/32 <= 65536;
+
         {
             ggml_metal_kargs_mul_mm_id_map0 args = {
                 ne02,
@@ -2761,6 +2779,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, bid_src2, 1);
             ggml_metal_encoder_set_buffer  (enc, bid_tpe,  2);
             ggml_metal_encoder_set_buffer  (enc, bid_ids,  3);
+            ggml_metal_encoder_set_buffer  (enc, bid_tiles, 4);
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
@@ -2771,7 +2790,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_op_concurrency_reset(ctx);
 
         {
-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op);
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op, compact);
 
             ggml_metal_kargs_mul_mm_id args = {
                 /*.ne00  =*/ ne00,
@@ -2799,12 +2818,20 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, bid_tpe,  3);
             ggml_metal_encoder_set_buffer  (enc, bid_ids,  4);
             ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+            ggml_metal_encoder_set_buffer  (enc, bid_tiles, 6);
 
             const size_t smem = pipeline.smem;
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+            if (compact) {
+                // row blocks x used (expert, token tile) pairs; the list's bound sizes the grid and the
+                // threadgroups past map0's count return at once
+                const int n_tiles_max = (int) ((ne20*ne21 + 31)/32 + ne02);
+                ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 63)/64, n_tiles_max, 1, 128, 1, 1);
+            } else {
+                ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+            }
         }
     } else {
         // IQ3_XXS: 8 rows per simdgroup; MXFP4: 4 simdgroups per threadgroup. Rows are reduced
