@@ -9,6 +9,7 @@
 #include <mach/mach.h>
 #endif
 #include <chrono>
+#include "llama-moe-lookahead.h"
 
 #include "llama-impl.h"
 
@@ -174,6 +175,12 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
         stats_dump_us = std::max<int64_t>(0, std::atoll(s))*1000;
     }
 
+    // enough to keep every reader busy a few slabs deep, not so much that a prefetch is still
+    // queued when its layer arrives
+    q_spec_max = (size_t) this->n_io_threads * 8;
+    if (const char * s = std::getenv("LLAMA_MOE_STREAM_SPEC_MAX")) {
+        q_spec_max = (size_t) std::max(0, atoi(s));
+    }
     if (const char * s = std::getenv("LLAMA_MOE_STREAM_WARM")) {
         warm_decode = atoi(s) != 0;
     }
@@ -1962,6 +1969,65 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     }
 
     mgr->stats.t_remap_op_us += ggml_time_us() - t_op0;
+}
+
+// Prefetch next-layer experts without another graph split. Wrong guesses consume
+// read bandwidth and can evict useful residents, so the candidate budget is bounded.
+static void llama_moe_stream_prefetch_next(llama_moe_stream_lookahead * la, const float * logits, uint32_t rows) {
+    llama_moe_stream_layer & sl = *la->sl_next;
+    auto * mgr = sl.mgr;
+
+    const uint32_t n = sl.n_expert;
+
+    llama_moe_lookahead_select(logits, n, rows, la->top_k, la->bias, la->score, la->selected);
+    for (size_t rank = 0; rank < la->selected.size(); ++rank) {
+        const int32_t best = la->selected[rank];
+        if (sl.expert_slot.find((int32_t) best) != sl.expert_slot.end()) {
+            continue;                  // already resident or in flight - the common case
+        }
+        if (mgr->q_spec.size() >= mgr->q_spec_max) {
+            break;                     // backlog already deeper than the drive will clear in time
+        }
+        const int32_t v = mgr->pick_victim_locked(sl, nullptr);
+        if (v < 0) {
+            break;                     // every slot busy; the layer's own remap will demand-load it
+        }
+        mgr->reserve_slot_locked(sl, (int32_t) best, v);
+        sl.slot_pending[v] = (uint8_t) sl.weights.size();
+        for (size_t wi = 0; wi < sl.weights.size(); wi++) {
+            mgr->q_spec.push_back({ &sl, (int32_t) best, v, (int32_t) wi, sl.slot_gen[v], mgr->allocation_epoch });
+            mgr->cv_work.notify_one();
+        }
+        mgr->stats.n_preload_issued++;
+    }
+}
+
+void llama_moe_stream_remap_la(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata) {
+    auto * la = (llama_moe_stream_lookahead *) userdata;
+
+    if (ith != 0 || la->sl_next == nullptr || la->top_k == 0) {
+        llama_moe_stream_remap(dst, a, ith, nth, la->sl);
+        return;
+    }
+
+    // b holds every row's prediction; llama_moe_lookahead_select uses the last row.
+    GGML_ASSERT(b->type == GGML_TYPE_F32 && ggml_is_contiguous(b));
+    const int64_t n_tok = b->ne[1] > 0 ? b->ne[1] : 1;
+    const float * logits = (const float *) b->data;
+
+    if (!la->bias_read) {
+        la->bias_read = true;
+        if (la->bias_src) {
+            la->bias.resize(ggml_nelements(la->bias_src));
+            ggml_backend_tensor_get(la->bias_src, la->bias.data(), 0, ggml_nbytes(la->bias_src));
+        }
+    }
+
+    llama_moe_stream_remap(dst, a, ith, nth, la->sl);
+    std::unique_lock<std::mutex> lk(la->sl_next->mgr->mtx);
+    if (!la->sl_next->mgr->load_failed) {
+        llama_moe_stream_prefetch_next(la, logits, (uint32_t) n_tok);
+    }
 }
 
 // stable per-wave userdata; grows lazily and records the per-wave expert capacity (set at build)
