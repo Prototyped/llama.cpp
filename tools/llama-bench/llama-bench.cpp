@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <iterator>
 #include <map>
 #include <numeric>
@@ -27,6 +28,10 @@
 #include "ggml.h"
 #include "llama.h"
 #include "log.h"
+
+// Internal telemetry for the opt-in fixed-position streaming experiment.
+#include "../../src/llama-model.h"
+#include "../../src/llama-moe-stream.h"
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -1322,6 +1327,12 @@ struct cmd_params_instance {
         llama_context_params cparams = llama_context_default_params();
 
         cparams.n_ctx           = n_prompt + n_gen + n_depth;
+        if (const char * fixed_step = std::getenv("LLAMA_BENCH_FIXED_STEP")) {
+            const int width = std::atoi(fixed_step);
+            GGML_ASSERT(width >= 1 && width <= 32);
+            cparams.n_ctx = std::max<uint32_t>(131072, cparams.n_ctx);
+            cparams.n_rs_seq = width;
+        }
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
         cparams.type_k          = type_k;
@@ -2174,6 +2185,20 @@ struct ctx_state {
     std::vector<uint8_t> buf; // the llama_context state buffer
 };
 
+// Isolated experiment only: all arms consume the same real-text prefix and continuations.
+static std::vector<llama_token> fixed_corpus(const llama_vocab * vocab) {
+    const char * path = std::getenv("LLAMA_BENCH_FIXED_CORPUS");
+    if (!path) {
+        return {};
+    }
+    std::ifstream in(path, std::ios::binary);
+    GGML_ASSERT(in.good());
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    auto tokens = common_tokenize(vocab, text, false, false);
+    GGML_ASSERT(!tokens.empty());
+    return tokens;
+}
+
 static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
@@ -2182,6 +2207,7 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
 
     std::vector<llama_token> tokens(n_batch);
+    const auto corpus = fixed_corpus(vocab);
 
     int n_processed = 0;
 
@@ -2190,6 +2216,14 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
         tokens[0]    = n_processed == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
         for (int i = 1; i < n_tokens; i++) {
             tokens[i] = std::rand() % n_vocab;
+        }
+        if (!corpus.empty()) {
+            for (int i = 0; i < n_tokens; ++i) {
+                tokens[i] = corpus[(n_processed + i) % corpus.size()];
+            }
+            if (n_processed == 0 && llama_vocab_get_add_bos(vocab)) {
+                tokens[0] = llama_vocab_bos(vocab);
+            }
         }
         int res = llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens));
         if (res != 0) {
@@ -2210,6 +2244,142 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
 
+    if (const char * fixed_step = std::getenv("LLAMA_BENCH_FIXED_STEP")) {
+        const int width = std::atoi(fixed_step);
+        GGML_ASSERT(width >= 1 && width <= 32);
+        if (const char * decode_ubatch = std::getenv("LLAMA_BENCH_FIXED_DECODE_UBATCH")) {
+            const int ubatch = std::atoi(decode_ubatch);
+            GGML_ASSERT(ubatch > width + 1);
+            // Expert capacity is fixed by default so IO policy A/Bs do not also change the cache
+            // budget. LLAMA_BENCH_FIXED_DECODE_CACHE=auto grows it the way the server does in decode
+            // (reclaimed workspace), or =N sets N slots - to measure at production residency.
+            uint32_t decode_cache = 0;
+            if (const char * c = std::getenv("LLAMA_BENCH_FIXED_DECODE_CACHE")) {
+                decode_cache = std::strcmp(c, "auto") == 0 ? UINT32_MAX : (uint32_t) std::strtoul(c, nullptr, 10);
+            }
+            GGML_ASSERT(llama_memory_phase_transition(ctx, nullptr, ubatch, 0, decode_cache));
+            fprintf(stderr, "FIXED_DECODE ubatch=%d cache_slots=%u\n", ubatch, llama_moe_stream_cache_slots(llama_get_model(ctx)));
+        }
+        auto * mem = llama_get_memory(ctx);
+        const llama_pos pos = llama_memory_seq_pos_max(mem, 0) + 1;
+        llama_batch batch = llama_batch_init(width, 0, 1);
+        uint64_t token_hash = 1469598103934665603ull;
+        uint32_t rng = 0x5a174231u;
+        double sum_ms = 0.0;
+        const auto corpus = fixed_corpus(vocab);
+        const char * arm = std::getenv("LLAMA_BENCH_FIXED_ARM");
+        if (!arm) { arm = "external"; }
+        auto * stream = model->moe_stream();
+        llama_moe_stream::llama_moe_stream_stats io_before{};
+        auto snapshot_io = [&]() {
+            if (stream) {
+                std::lock_guard<std::mutex> lock(stream->mtx);
+                io_before = stream->stats;
+            }
+        };
+        auto print_io = [&](const char * tag) {
+            if (!stream) { return; }
+            std::lock_guard<std::mutex> lock(stream->mtx);
+            const auto & now = stream->stats;
+            fprintf(stderr, "%s arm=%s steps=%d read_mib=%.6f stall_ms=%.6f remap_ms=%.6f"
+                    " misses=%" PRId64 " ready=%" PRId64 " late=%" PRId64 " spec_slabs=%" PRId64 "\n",
+                    tag, arm, n_gen, (now.n_bytes_read - io_before.n_bytes_read)/1048576.0,
+                    (now.t_stall_us - io_before.t_stall_us)/1000.0,
+                    (now.t_remap_op_us - io_before.t_remap_op_us)/1000.0,
+                    now.n_miss - io_before.n_miss, now.n_hit_ready - io_before.n_hit_ready,
+                    now.n_hit_loading - io_before.n_hit_loading,
+                    now.n_spec_dispatch - io_before.n_spec_dispatch);
+        };
+        std::vector<float> check_logits;
+        // The first batch is repeated after rollback. Its logits must agree before any
+        // latency numbers are trusted; a position-only assertion would miss bad RNN rewinds.
+        for (int check = 0; check < 2; ++check) {
+            common_batch_clear(batch);
+            for (int j = 0; j < width; ++j) {
+                const llama_token tok = corpus.empty() ? 42 + j : corpus[(pos + j) % corpus.size()];
+                common_batch_add(batch, tok, pos + j, { 0 }, true);
+            }
+            GGML_ASSERT(llama_decode(ctx, batch) == 0);
+            llama_synchronize(ctx);
+            const size_t count = (size_t) width*n_vocab;
+            const float * logits = llama_get_logits(ctx);
+            GGML_ASSERT(logits);
+            if (check == 0) {
+                check_logits.assign(logits, logits + count);
+            } else {
+                double max_abs = 0.0;
+                for (size_t j = 0; j < count; ++j) {
+                    GGML_ASSERT(std::isfinite(logits[j]) && std::isfinite(check_logits[j]));
+                    max_abs = std::max(max_abs, (double) std::abs(logits[j] - check_logits[j]));
+                }
+                fprintf(stderr, "FIXED_ROLLBACK_CHECK arm=%s pos=%d width=%d max_abs=%.9g\n", arm, (int) pos, width, max_abs);
+                GGML_ASSERT(max_abs < 1e-4);
+            }
+            GGML_ASSERT(llama_memory_seq_rm(mem, 0, pos, -1));
+        }
+        if (const char * logits_dir = std::getenv("LLAMA_BENCH_FIXED_LOGITS_DIR")) {
+            const std::string path = std::string(logits_dir) + "/" + arm + "-" + std::to_string(pos) + "-" + std::to_string(width) + ".f32";
+            std::ofstream out(path, std::ios::binary);
+            GGML_ASSERT(out.good());
+            out.write((const char *) check_logits.data(), check_logits.size()*sizeof(float));
+            GGML_ASSERT(out.good());
+        }
+        // Warm the same continuation sequence in every arm; the first arm must not pay
+        // post-prefill expert-cache coldness while later arms inherit a warm decode cache.
+        snapshot_io();
+        for (int i = -n_gen; i < n_gen; ++i) {
+            const int sample = i < 0 ? i + n_gen : i;
+            if (i == 0) {
+                print_io("FIXED_FIRST_IO");
+                rng = 0x5a174231u;
+                token_hash = 1469598103934665603ull;
+                snapshot_io();
+            }
+            GGML_ASSERT(llama_memory_seq_pos_max(mem, 0) + 1 == pos);
+            common_batch_clear(batch);
+            for (int j = 0; j < width; ++j) {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                const llama_token tok = corpus.empty() ? rng % n_vocab : corpus[(pos + sample*width + j) % corpus.size()];
+                token_hash = (token_hash ^ (uint32_t) tok)*1099511628211ull;
+                common_batch_add(batch, tok, pos + j, { 0 }, true);
+            }
+            const uint64_t start = get_time_ns();
+            const int rc = llama_decode(ctx, batch);
+            llama_synchronize(ctx);
+            const double ms = (get_time_ns() - start)/1e6;
+            if (rc != 0) {
+                llama_batch_free(batch);
+                return false;
+            }
+            if (i >= 0) { sum_ms += ms; }
+            fprintf(stderr, "FIXED_%s arm=%s pos=%d width=%d step=%d ms=%.6f token_hash=%016" PRIx64 "\n",
+                    i < 0 ? "WARM" : "STEP", arm, (int) pos, width, sample, ms, token_hash);
+            // Check output after the adaptive policy has had time to engage too.
+            // Disk writes are outside the timing and only at the two phase boundaries.
+            if (sample == n_gen - 1) {
+                if (const char * dir = std::getenv("LLAMA_BENCH_FIXED_LOGITS_DIR")) {
+                    const std::string path = std::string(dir) + "/" + arm + (i < 0 ? "-first-end.f32" : "-replay-end.f32");
+                    std::ofstream out(path, std::ios::binary);
+                    out.write((const char *) llama_get_logits(ctx), (size_t) width*n_vocab*sizeof(float));
+                    GGML_ASSERT(out.good());
+                }
+            }
+            // Rollback is setup, outside the timed decode-plus-synchronize interval.
+            if (!llama_memory_seq_rm(mem, 0, pos, -1)) {
+                fprintf(stderr, "FIXED_STEP rollback failed at pos=%d width=%d\n", (int) pos, width);
+                llama_batch_free(batch);
+                return false;
+            }
+        }
+        fprintf(stderr, "FIXED_STEP_SUMMARY arm=%s pos=%d width=%d steps=%d mean_ms=%.6f\n",
+                arm, (int) pos, width, n_gen, sum_ms/n_gen);
+        print_io("FIXED_IO");
+        llama_batch_free(batch);
+        return true;
+    }
+
     llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
 
     for (int i = 0; i < n_gen; i++) {
@@ -2228,6 +2398,11 @@ static void llama_null_log_callback(enum ggml_log_level level, const char * text
     (void) level;
     (void) text;
     (void) user_data;
+    if (std::getenv("LLAMA_BENCH_FIXED_STEP") &&
+        (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN ||
+         std::strstr(text, "buffer size") || std::strstr(text, "size ="))) {
+        std::fputs(text, stderr);
+    }
 }
 
 static std::unique_ptr<printer> create_printer(output_formats format) {
@@ -2309,6 +2484,24 @@ int llama_bench(int argc, char ** argv) {
     }
 
     std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
+    std::vector<std::string> fixed_arms;
+    if (const char * arm_list = std::getenv("LLAMA_BENCH_FIXED_ARMS")) {
+        GGML_ASSERT(std::getenv("LLAMA_BENCH_FIXED_STEP"));
+        std::istringstream list(arm_list);
+        std::string arm;
+        while (std::getline(list, arm, ',')) {
+            GGML_ASSERT(arm == "base" || arm == "sparse" || arm == "pool" || arm == "both" || arm == "protect");
+            fixed_arms.push_back(arm);
+        }
+        GGML_ASSERT(!fixed_arms.empty());
+        const auto original = params_instances;
+        params_instances.clear();
+        for (const auto & inst : original) {
+            for (size_t i = 0; i < fixed_arms.size(); ++i) {
+                params_instances.push_back(inst);
+            }
+        }
+    }
 
     llama_model *               lmodel    = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
@@ -2320,6 +2513,11 @@ int llama_bench(int argc, char ** argv) {
     int  params_idx   = 0;
     auto params_count = params_instances.size();
     for (const auto & inst : params_instances) {
+        if (!fixed_arms.empty()) {
+            const std::string & arm = fixed_arms[params_idx % fixed_arms.size()];
+            setenv("LLAMA_BENCH_FIXED_ARM", arm.c_str(), 1);
+            fprintf(stderr, "FIXED_ARM index=%d arm=%s depth=%d\n", params_idx, arm.c_str(), inst.n_depth);
+        }
         params_idx++;
         if (params.progress) {
             fprintf(stderr, "llama-bench: benchmark %d/%zu: starting\n", params_idx, params_count);
