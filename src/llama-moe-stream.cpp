@@ -2215,12 +2215,18 @@ void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int3
     sl.plan_n_waves   = (uint32_t) ((sl.uniq.size() + sl.plan_capacity - 1)/sl.plan_capacity);
     sl.plan_next_wave = 0;
 
-    // Wave slices. The masked path packs uniq into full groups of plan_capacity, which is what it has
-    // always done. The partition path CANNOT: the graph sized its pair chunk from the wave count it
-    // built, so the planner has to produce exactly that many waves. A ubatch touching few experts
-    // otherwise plans fewer, fatter waves than the graph expects, and each then holds more pairs than
-    // the chunk allows - a repetitive prompt planned 2 waves against a graph built for 5, putting
-    // n_pairs/2 = 1536 pairs into a chunk of 1127. No balancing can fix a wave-count disagreement.
+    // Wave slices. The masked path packs uniq into full groups of plan_capacity, so wave 0 always
+    // holds plan_capacity experts. It must: stage_wave_locked parks the masked-out pairs of a short
+    // wave on slots borrowed from the previous wave's pool, and wave 0 has no pool (empty cache, or
+    // the first ubatch after a reset), while emit_wave_slots needs n_ids distinct resident slots per
+    // token row.
+    //
+    // The partition path CANNOT pack: the graph sized its pair chunk from the wave count it built, so
+    // the planner has to produce exactly that many waves. A ubatch touching few experts otherwise
+    // plans fewer, fatter waves than the graph expects, and each then holds more pairs than the chunk
+    // allows - a repetitive prompt planned 2 waves against a graph built for 5, putting n_pairs/2 =
+    // 1536 pairs into a chunk of 1127. No balancing can fix a wave-count disagreement.
+    const bool partitioned = sl.plan_pair_chunk > 0;
     const size_t n_uniq = sl.uniq.size();
     if (sl.plan_waves_want > 1 && n_uniq >= sl.plan_waves_want) {
         sl.plan_n_waves = sl.plan_waves_want;
@@ -2228,12 +2234,16 @@ void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int3
     sl.wave_first.assign(sl.plan_n_waves, 0);
     sl.wave_count.assign(sl.plan_n_waves, 0);
     {
-        // spread the experts evenly over exactly plan_n_waves slices, never exceeding plan_capacity
+        // partition: spread the experts evenly over exactly plan_n_waves slices, never exceeding
+        // plan_capacity - plan_pairs_locked re-slices them by pair count anyway
+        // masked: pack full groups, so no wave but the last one is short
         const size_t base = n_uniq/sl.plan_n_waves;
         const size_t rem  = n_uniq%sl.plan_n_waves;
         size_t at = 0;
         for (uint32_t w = 0; w < sl.plan_n_waves; w++) {
-            const size_t cnt = std::min<size_t>(base + (w < rem ? 1 : 0), sl.plan_capacity);
+            const size_t cnt = partitioned
+                    ? std::min<size_t>(base + (w < rem ? 1 : 0), sl.plan_capacity)
+                    : std::min<size_t>(sl.plan_capacity, n_uniq - at);
             sl.wave_first[w] = (uint32_t) at;
             sl.wave_count[w] = (uint32_t) cnt;
             at += cnt;
@@ -2518,8 +2528,9 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
             sl.keep[s] = 1; // parking slots must survive this wave's loads
             need--;
         }
-        // the previous pool has at least n_ids distinct slots and at most count collide with this
-        //   wave's demand, so the walk above always finds the required n_ids - count
+        // the previous pool holds >= n_ids distinct slots (asserted below) and at most count of them
+        //   collide with this wave's demand, so the walk finds the required n_ids - count. wave 0 has
+        //   no previous pool, hence the plan_waves_locked guarantee that it is never short
         GGML_ASSERT(need == 0);
     }
 
@@ -2806,6 +2817,11 @@ static std::unique_lock<std::mutex> stage_wave_for_op(llama_moe_stream_layer & s
 
     if (w == 0) {
         mgr->plan_waves_locked(sl, ids, n);
+
+        // the masked path parks the masked-out pairs of a short wave on n_ids borrowed resident slots,
+        // and wave 0 has no pool to borrow from - so the planner must pack it full. the partition path
+        // needs only one parking slot, and re-slices its groups by pair count
+        GGML_ASSERT(sl.plan_pair_chunk > 0 || sl.wave_count[0] >= n_ids);
     }
     GGML_ASSERT(sl.plan_next_wave == w); // waves must run in order (enforced by the graph ordering token)
 
