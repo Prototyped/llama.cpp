@@ -3836,6 +3836,14 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // simdgroups per threadgroup (a.k.a. warps)
         int32_t nsg = (ne00 >= 512 || nqptg > OP_FLASH_ATTN_EXT_NQPSG) ? 8 : 4;
 
+        // the quantized-K staging scratch (the is_q term) can push nsg=8 past the device limit at
+        // large head sizes: dk=dv=512 with a quantized cache needs 36864 B, and nsg=4 lands exactly
+        // on 32768 B. nsg=4 exists only for the narrow tile, so a wide tile has no smaller fallback
+        if (nsg > 4 && fa_smem(nsg) > props_dev->max_theadgroup_memory_size) {
+            GGML_ASSERT(nqptg == OP_FLASH_ATTN_EXT_NQPSG);
+            nsg = 4;
+        }
+
         const size_t smem = fa_smem(nsg);
         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
 
