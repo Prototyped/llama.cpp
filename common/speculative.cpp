@@ -2973,11 +2973,6 @@ common_speculative_init_result::common_speculative_init_result(
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
 
-    // A "shared-" MTP sidecar ships without token_embd and borrows the target's, so it needs to
-    // know which model to borrow from before it is loaded. Harmless for a sidecar that carries
-    // its own: the donor is only consulted when the tensor is absent.
-    mparams.tensor_donor = llama_get_model(ctx_tgt);
-
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
