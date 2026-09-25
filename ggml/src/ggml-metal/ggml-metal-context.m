@@ -72,6 +72,10 @@ struct ggml_metal {
     // GGML_METAL_KPROF: node map key of the current graph, hashed once per compute
     uint64_t kprof_key;
 
+    // host ops (on unless GGML_METAL_HOST_OPS=0) and the event base reserved for the current graph
+    ggml_metal_host_ops_t hops;
+    uint64_t hops_base;
+
     // the callback given to the thread pool
     void (^encode_async)(size_t ith);
 
@@ -208,6 +212,9 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
         res->pipelines_ext = ggml_metal_pipelines_init();
 
+        res->hops      = ggml_metal_host_ops_enabled() ? ggml_metal_host_ops_init(dev) : NULL;
+        res->hops_base = 0;
+
         return res;
     }
 }
@@ -297,6 +304,9 @@ void ggml_metal_free(ggml_metal_t ctx) {
     }
 
     Block_release(ctx->encode_async);
+
+    ggml_metal_host_ops_free(ctx->hops);
+    ctx->hops = NULL;
 
     //[ctx->queue release]; // [TAG_QUEUE_PER_BACKEND]
 
@@ -648,8 +658,20 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     //
     // tests on M1 Pro and M2 Ultra using LLaMA models, show that optimal values for n_cb are 1 or 2
 
+    bool has_host_ops = false;
+
     @autoreleasepool {
         ctx->gf = gf;
+
+        // a graph with host ops completes before this returns: the host thread works on its nodes,
+        // and the caller may rebuild or free the graph as soon as compute returns (llama_decode does,
+        // for a ubatch without outputs), so the nodes must not outlive this call
+        if (ctx->hops) {
+            ctx->hops_base = ggml_metal_host_ops_reserve(ctx->hops, gf->n_nodes);
+            for (int i = 0; i < gf->n_nodes && !has_host_ops; ++i) {
+                has_host_ops = ggml_map_custom_is_host_op(gf->nodes[i]);
+            }
+        }
 
         if (ctx->n_cb == 0) {
             // single-threaded encoding: the whole graph is encoded by one command buffer
@@ -807,6 +829,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
     }
 
+    if (has_host_ops) {
+        ggml_metal_synchronize(ctx);
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -904,6 +930,10 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->use_concurrency,
             ctx->capture_compute == 0,
             ctx->debug_graph);
+
+        if (ctx->hops) {
+            ggml_metal_op_set_host_ops(ctx_op, ctx->hops, ctx->hops_base);
+        }
 
         if (ggml_metal_kprof_stride() > 0) {
             ggml_metal_op_set_kprof_key(ctx_op, ctx->kprof_key);

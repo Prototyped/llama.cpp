@@ -6158,6 +6158,19 @@ struct ggml_tensor * ggml_map_custom1(
     return ggml_map_custom1_impl(ctx, a, fun, n_tasks, userdata, false);
 }
 
+// the last op_params word, past the map_custom params structs
+#define GGML_MAP_CUSTOM_HOST_OP_PARAM (GGML_MAX_OP_PARAMS/sizeof(int32_t) - 1)
+
+void ggml_map_custom_set_host_op(struct ggml_tensor * t) {
+    GGML_ASSERT(t->op == GGML_OP_MAP_CUSTOM1 || t->op == GGML_OP_MAP_CUSTOM2 || t->op == GGML_OP_CUSTOM);
+    ggml_set_op_params_i32(t, GGML_MAP_CUSTOM_HOST_OP_PARAM, 1);
+}
+
+bool ggml_map_custom_is_host_op(const struct ggml_tensor * t) {
+    return (t->op == GGML_OP_MAP_CUSTOM1 || t->op == GGML_OP_MAP_CUSTOM2 || t->op == GGML_OP_CUSTOM) &&
+        ggml_get_op_params_i32(t, GGML_MAP_CUSTOM_HOST_OP_PARAM) == 1;
+}
+
 struct ggml_tensor * ggml_map_custom1_inplace(
         struct ggml_context      * ctx,
         struct ggml_tensor       * a,

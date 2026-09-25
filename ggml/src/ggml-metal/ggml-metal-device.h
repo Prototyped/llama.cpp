@@ -91,6 +91,19 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
+// host ops (on unless GGML_METAL_HOST_OPS=0): a custom node marked with ggml_map_custom_set_host_op runs
+// on a host thread while the command buffer waits on an event, so the graph needs no split for it
+typedef struct ggml_metal_host_ops * ggml_metal_host_ops_t;
+
+bool                  ggml_metal_host_ops_enabled(void);
+ggml_metal_host_ops_t ggml_metal_host_ops_init   (ggml_metal_device_t dev);
+void                  ggml_metal_host_ops_free   (ggml_metal_host_ops_t hops);
+// reserve event values for a graph of n nodes; node i signals base + 2*i + 1 and resumes at + 2
+uint64_t              ggml_metal_host_ops_reserve(ggml_metal_host_ops_t hops, int n);
+
+// end the current compute pass, signal v, wait for v + 1 and continue in a new pass
+void ggml_metal_encoder_host_op(ggml_metal_encoder_t encoder, ggml_metal_host_ops_t hops, uint64_t v, struct ggml_tensor * node);
+
 //
 // GGML_METAL_KPROF: per-kernel GPU attribution (opt-in, measurement only)
 //
