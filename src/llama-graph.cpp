@@ -2337,6 +2337,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         } else {
             ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
         }
+        // the remap only relabels ids in shared memory: a unified-memory backend may run it inline
+        // (Metal host ops) instead of splitting the graph for a CPU round trip every layer
+        ggml_map_custom_set_host_op(ids_gemm);
         cb(ids_gemm, "ffn_moe_topk_stream", il);
     }
 

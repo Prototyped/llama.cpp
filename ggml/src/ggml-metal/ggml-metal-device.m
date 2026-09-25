@@ -1305,6 +1305,183 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
 }
 
+//
+// host ops
+//
+
+#define GGML_METAL_HOST_OPS_MAX 4096
+
+struct ggml_metal_host_task {
+    uint64_t             v;
+    struct ggml_tensor * node;
+};
+
+struct ggml_metal_host_ops {
+    id<MTLSharedEvent> ev;
+
+    pthread_t       thread;
+    pthread_mutex_t mtx;
+    pthread_cond_t  cv;
+
+    struct ggml_metal_host_task tasks[GGML_METAL_HOST_OPS_MAX];
+    int  n_tasks;
+    bool stop;
+
+    uint64_t next; // next unreserved event value
+};
+
+bool ggml_metal_host_ops_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        // on by default; GGML_METAL_HOST_OPS=0 falls back to a graph split per host op
+        const char * e = getenv("GGML_METAL_HOST_OPS");
+        enabled = e == NULL || atoi(e) != 0;
+    }
+    return enabled == 1;
+}
+
+static void ggml_metal_host_task_run(struct ggml_tensor * node) {
+    if (node->op == GGML_OP_MAP_CUSTOM1) {
+        struct ggml_map_custom1_op_params p;
+        memcpy(&p, node->op_params, sizeof(p));
+        p.fun(node, node->src[0], 0, 1, p.userdata);
+    } else if (node->op == GGML_OP_MAP_CUSTOM2) {
+        struct ggml_map_custom2_op_params p;
+        memcpy(&p, node->op_params, sizeof(p));
+        p.fun(node, node->src[0], node->src[1], 0, 1, p.userdata);
+    } else {
+        GGML_ASSERT(node->op == GGML_OP_CUSTOM);
+        struct ggml_custom_op_params p;
+        memcpy(&p, node->op_params, sizeof(p));
+        p.fun(node, 0, 1, p.userdata);
+    }
+}
+
+// Waits for the GPU to signal a posted task's value, runs the task and signals the next value so the
+// GPU resumes. It spins on the event while tasks are pending: a blocking wait costs ~50 us more per
+// round trip on M1 (160 vs 208 us measured) and the GPU is idle for all of it. The GPU side only
+// waits on the event, which the host always signals, so a host-side stall never wedges the GPU.
+static void * ggml_metal_host_ops_worker(void * arg) {
+    struct ggml_metal_host_ops * hops = arg;
+
+    for (;;) {
+        pthread_mutex_lock(&hops->mtx);
+        while (hops->n_tasks == 0 && !hops->stop) {
+            pthread_cond_wait(&hops->cv, &hops->mtx);
+        }
+        if (hops->n_tasks == 0 && hops->stop) {
+            pthread_mutex_unlock(&hops->mtx);
+            break;
+        }
+        pthread_mutex_unlock(&hops->mtx);
+
+        const uint64_t s = [hops->ev signaledValue];
+
+        struct ggml_tensor * node = NULL;
+
+        pthread_mutex_lock(&hops->mtx);
+        for (int i = 0; i < hops->n_tasks; ++i) {
+            if (hops->tasks[i].v == s) {
+                node = hops->tasks[i].node;
+                hops->tasks[i] = hops->tasks[--hops->n_tasks];
+                break;
+            }
+        }
+        pthread_mutex_unlock(&hops->mtx);
+
+        if (node == NULL) {
+            __asm__ __volatile__("yield");
+            continue;
+        }
+
+        ggml_metal_host_task_run(node);
+
+        // the node's writes must be visible before the GPU resumes and reads them
+        atomic_thread_fence(memory_order_seq_cst);
+        [hops->ev setSignaledValue:s + 1];
+    }
+
+    return NULL;
+}
+
+ggml_metal_host_ops_t ggml_metal_host_ops_init(ggml_metal_device_t dev) {
+    struct ggml_metal_host_ops * hops = calloc(1, sizeof(struct ggml_metal_host_ops));
+
+    hops->ev = [(id<MTLDevice>) ggml_metal_device_get_obj(dev) newSharedEvent];
+    hops->ev.signaledValue = 0;
+    hops->next = 2;
+
+    pthread_mutex_init(&hops->mtx, NULL);
+    pthread_cond_init (&hops->cv,  NULL);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_create(&hops->thread, &attr, ggml_metal_host_ops_worker, hops);
+    pthread_attr_destroy(&attr);
+
+    GGML_LOG_INFO("%s: host ops enabled: marked custom ops run inline, without graph splits\n", __func__);
+
+    return hops;
+}
+
+void ggml_metal_host_ops_free(ggml_metal_host_ops_t hops) {
+    if (hops == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&hops->mtx);
+    hops->stop = true;
+    pthread_cond_signal(&hops->cv);
+    pthread_mutex_unlock(&hops->mtx);
+
+    pthread_join(hops->thread, NULL);
+
+    pthread_cond_destroy (&hops->cv);
+    pthread_mutex_destroy(&hops->mtx);
+
+    [hops->ev release];
+
+    free(hops);
+}
+
+uint64_t ggml_metal_host_ops_reserve(ggml_metal_host_ops_t hops, int n) {
+    pthread_mutex_lock(&hops->mtx);
+    const uint64_t base = hops->next;
+    hops->next += 2*(uint64_t) n + 2;
+    pthread_mutex_unlock(&hops->mtx);
+    return base;
+}
+
+void ggml_metal_encoder_host_op(ggml_metal_encoder_t encoder, ggml_metal_host_ops_t hops, uint64_t v, struct ggml_tensor * node) {
+    [encoder->obj endEncoding];
+    [encoder->obj release];
+
+    // posted before the signal is encoded: the GPU cannot reach it before this buffer is committed
+    pthread_mutex_lock(&hops->mtx);
+    GGML_ASSERT(hops->n_tasks < GGML_METAL_HOST_OPS_MAX);
+    hops->tasks[hops->n_tasks++] = (struct ggml_metal_host_task) { v, node };
+    pthread_cond_signal(&hops->cv);
+    pthread_mutex_unlock(&hops->mtx);
+
+    [encoder->cmd_buf encodeSignalEvent:hops->ev value:v];
+    [encoder->cmd_buf encodeWaitForEvent:hops->ev value:v + 1];
+
+    if (encoder->kprof != NULL) {
+        // the profiler times passes: continue in a new timed one (attributed like the prologue)
+        ggml_metal_encoder_kprof_begin(encoder, -1);
+        return;
+    }
+
+    if (encoder->concurrent) {
+        encoder->obj = [encoder->cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
+    } else {
+        encoder->obj = [encoder->cmd_buf computeCommandEncoder];
+    }
+
+    [encoder->obj retain];
+}
+
 struct ggml_metal_device {
     id<MTLDevice> mtl_device;
 
@@ -1978,6 +2155,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return false;
             }
         }
+    }
+
+    // a marked host op runs on the host against shared memory, inline in the command buffer
+    if (op->op == GGML_OP_MAP_CUSTOM1 || op->op == GGML_OP_MAP_CUSTOM2 || op->op == GGML_OP_CUSTOM) {
+        return ggml_metal_host_ops_enabled() && dev->props.use_shared_buffers && ggml_map_custom_is_host_op(op);
     }
 
     switch (op->op) {

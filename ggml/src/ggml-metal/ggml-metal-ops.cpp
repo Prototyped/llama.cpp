@@ -137,6 +137,11 @@ private:
 
     // non-empty node indices
     std::vector<int> idxs;
+
+public:
+    // host ops (nullptr when disabled)
+    ggml_metal_host_ops_t hops = nullptr;
+    uint64_t hops_base = 0;
 };
 
 ggml_metal_op_t ggml_metal_op_init(
@@ -170,6 +175,23 @@ void ggml_metal_op_free(ggml_metal_op_t ctx) {
 void ggml_metal_op_set_kprof_key(ggml_metal_op_t ctx, uint64_t key) {
     ctx->kprof_key = key;
     ggml_metal_encoder_kprof_set_graph(ctx->enc, ctx->graph_uid(), key);
+}
+
+void ggml_metal_op_set_host_ops(ggml_metal_op_t ctx, ggml_metal_host_ops_t hops, uint64_t base) {
+    ctx->hops      = hops;
+    ctx->hops_base = base;
+}
+
+static int ggml_metal_op_host(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    GGML_ASSERT(ctx->hops && "host op encoded without host ops enabled");
+
+    const uint64_t v = ctx->hops_base + 2*(uint64_t) ctx->raw_idx(idx) + 1;
+
+    ggml_metal_encoder_host_op(ctx->enc, ctx->hops, v, op);
+
+    return 1;
 }
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
@@ -304,6 +326,12 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     }
 
     switch (node->op) {
+        case GGML_OP_MAP_CUSTOM1:
+        case GGML_OP_MAP_CUSTOM2:
+        case GGML_OP_CUSTOM:
+            {
+                n_fuse = ggml_metal_op_host(ctx, idx);
+            } break;
         case GGML_OP_CONCAT:
             {
                 n_fuse = ggml_metal_op_concat(ctx, idx);

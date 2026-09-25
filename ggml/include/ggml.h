@@ -2772,6 +2772,12 @@ extern "C" {
             int                     n_tasks,
             void                  * userdata);
 
+    // Mark a map_custom1/2 or custom node as a host op: a backend that shares memory with the host may run its
+    // function inline on a host thread instead of splitting the graph around it. The function must
+    // be safe to call with ith = 0, nth = 1 from a thread other than the graph's caller.
+    GGML_API void ggml_map_custom_set_host_op(struct ggml_tensor * t);
+    GGML_API bool ggml_map_custom_is_host_op(const struct ggml_tensor * t);
+
     GGML_API struct ggml_tensor * ggml_map_custom1_inplace(
             struct ggml_context   * ctx,
             struct ggml_tensor    * a,
