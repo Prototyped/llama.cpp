@@ -92,6 +92,44 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
 //
+// GGML_METAL_KPROF: per-kernel GPU attribution (opt-in, measurement only)
+//
+// Apple GPUs only support MTLCounterSamplingPointAtStageBoundary - verified on M1 Max, where
+// Draw/Dispatch/TileDispatch/BlitBoundary all report unsupported - so per-dispatch GPU timestamps
+// are not available. Instead, when kprof is active the encoder is split into one compute pass per
+// node (or per GGML_METAL_KPROF nodes) and each pass samples the GPU timestamp counter at its start
+// and end boundary. Splitting costs one encoder boundary per segment; sweeping the stride
+// (GGML_METAL_KPROF=1,2,4,8,...) calibrates that overhead.
+//
+// Ported from Agusx1211/llama-cpp-ds4f-m2-ultra. Measurement only: when GGML_METAL_KPROF is unset
+// every function here is a no-op and the encode path is byte-for-byte the usual one.
+//
+
+// Value of `name` when it parses as a positive integer, else 0 (unset, empty, malformed, or <= 0).
+//
+// Every opt-in switch here must go through this rather than a `getenv(...) != NULL` presence test:
+// with a presence test, `VAR=0` ENABLES the feature, which silently inverts any A/B that tries to
+// turn it off. That defect cost a real measurement in LLAMA_MOE_STREAM_PARTITION.
+int  ggml_metal_positive_env(const char * name);
+
+// non-zero when GGML_METAL_KPROF is set to a positive stride
+int  ggml_metal_kprof_stride(void);
+
+// end the current compute pass and begin a new counter-sampled one. `raw_node_idx` is the graph
+// node index that starts the new segment. no-op (returns -1) when kprof is inactive.
+int  ggml_metal_encoder_kprof_split(ggml_metal_encoder_t encoder, int raw_node_idx);
+
+// Stable key for the node map emitted by KPROF, and metadata attachment for an encoder batch.
+// The key covers each node's op, type and name but not its shape, which changes as the KV cache
+// grows, so a dumped map's ne are those of the first graph with that key.
+uint64_t ggml_metal_kprof_graph_key(const struct ggml_cgraph * gf);
+void ggml_metal_encoder_kprof_set_graph(ggml_metal_encoder_t encoder, uint64_t uid, uint64_t key);
+
+// resolve every completed segment recorded since the last flush and emit one `KPROF ` JSONL record
+// per segment on stderr. Batches whose command buffers are still running remain queued.
+void ggml_metal_kprof_flush(void);
+
+//
 // MTLLibrary wrapper
 //
 

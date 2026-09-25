@@ -23,6 +23,9 @@ ggml_metal_op_t ggml_metal_op_init(
 
 void ggml_metal_op_free(ggml_metal_op_t ctx);
 
+// GGML_METAL_KPROF: the graph's node map key, computed once by the caller
+void ggml_metal_op_set_kprof_key(ggml_metal_op_t ctx, uint64_t key);
+
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
