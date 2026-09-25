@@ -49,7 +49,10 @@ struct ggml_metal_op {
         this->use_concurrency = use_concurrency;
         this->use_capture     = use_capture;
         this->debug_graph     = debug_graph;
+        this->kprof_stride    = ggml_metal_kprof_stride();
+        this->kprof_count     = 0;
         this->gf              = gf;
+        this->kprof_key       = 0;
 
         idxs.reserve(gf->n_nodes);
 
@@ -76,6 +79,16 @@ struct ggml_metal_op {
     ggml_tensor * node(int i) const {
         assert(i >= 0 && i < (int) idxs.size());
         return ggml_graph_node(gf, idxs[i]);
+    }
+
+    uint64_t graph_uid() const {
+        return gf->uid;
+    }
+
+    // raw index into gf->nodes, which is what KPROF records refer to
+    int raw_idx(int i) const {
+        assert(i >= 0 && i < (int) idxs.size());
+        return idxs[i];
     }
 
     // consult the fusion table for the longest pattern starting at i0
@@ -110,6 +123,11 @@ struct ggml_metal_op {
     bool use_capture;
 
     int debug_graph;
+
+    // GGML_METAL_KPROF: split the encoder every `kprof_stride` non-noop nodes
+    int kprof_stride = 0;
+    int kprof_count  = 0;
+    uint64_t kprof_key = 0;
 
 private:
     ggml_cgraph * gf;
@@ -147,6 +165,11 @@ ggml_metal_op_t ggml_metal_op_init(
 
 void ggml_metal_op_free(ggml_metal_op_t ctx) {
     delete ctx;
+}
+
+void ggml_metal_op_set_kprof_key(ggml_metal_op_t ctx, uint64_t key) {
+    ctx->kprof_key = key;
+    ggml_metal_encoder_kprof_set_graph(ctx->enc, ctx->graph_uid(), key);
 }
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
@@ -545,7 +568,24 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
-    if (ctx->use_capture) {
+    if (ctx->kprof_stride > 0) {
+        if (ctx->kprof_count % ctx->kprof_stride == 0) {
+            // a new compute pass is a full execution barrier, so the concurrency tracker restarts
+            if (ggml_metal_encoder_kprof_split(ctx->enc, ctx->raw_idx(idx)) >= 0 && ctx->mem_ranges) {
+                ggml_mem_ranges_reset(ctx->mem_ranges);
+            }
+        }
+        ctx->kprof_count++;
+    }
+
+    // GGML_METAL_DEBUG_GROUPS names every dispatch after its ggml op so an external Metal profiler
+    // can attribute GPU time per op. use_capture already does this, but only for ONE graph and only
+    // while starting a real Metal capture, which conflicts with a profiler that is already recording.
+    static const bool debug_groups = ggml_metal_positive_env("GGML_METAL_DEBUG_GROUPS") > 0;
+
+    const bool label = ctx->use_capture || debug_groups;
+
+    if (label) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
     }
 
@@ -555,7 +595,7 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
                 "https://github.com/ggml-org/llama.cpp/pull/14849");
     }
 
-    if (ctx->use_capture) {
+    if (label) {
         ggml_metal_encoder_debug_group_pop(ctx->enc);
     }
 
