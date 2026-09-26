@@ -329,6 +329,267 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 #undef DV
 }
 
+// Sparse flash attention with the heads as the matrix rows: one threadgroup per (query row, KV head).
+// The G query heads that share a KV head form the rows of the Q tile, so each gathered K/V row is
+// loaded once for all G heads and the products run on simdgroup matrices. Walks the index lists
+// built by kernel_flash_attn_ext_vec_idx (ascending, -1 padded). F16 K/V, DK == DV == D, G <= 16,
+// mask shared by all heads.
+template<short D, short NSG>
+kernel void kernel_flash_attn_ext_sparse_hr(
+        constant ggml_metal_kargs_flash_attn_ext_vec & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const int  * idx,
+        device       char * dst,
+        threadgroup  half * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short NT  = NSG*N_SIMDWIDTH;
+    constexpr short R   = 16;     // Q rows (heads), two 8-row blocks
+    constexpr short RS  = R/NSG;  // softmax rows per simdgroup
+    constexpr short C   = 32;     // gathered cells per step
+    constexpr short DS  = D/NSG;  // O columns per simdgroup
+    constexpr short NO  = DS/8;
+
+    const int iq1 = tgpig[0];
+    const int ikv = tgpig[1];
+    const int iq3 = tgpig[2];
+
+    const int G    = args.ne02/args.ne_12_2;
+    const int ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+    threadgroup half  * sq    = shmem;                                 // [R][D]
+    threadgroup half  * sk    = sq + R*D;                              // [C][D] K, then V
+    threadgroup float * ss    = (threadgroup float *) (sk + C*D);      // [R][C] scores, then P
+    threadgroup float * sdiag = ss + R*C;                              // [2][8][8] rescale diagonals
+    threadgroup float * sms   = sdiag + 2*64;                          // [R] rescale factors, then sums
+    threadgroup int   * sid   = (threadgroup int *) (sms + R);         // [C] cell ids
+    threadgroup half  * smk   = (threadgroup half *) (sid + C);        // [C] mask values
+
+    device const int  * pidx = idx + (((int64_t) (iq3%args.ne33)*args.ne32)*args.ne31 + iq1)*args.n_kv_max_padded;
+    device const half * pm   = (device const half *) (mask + iq1*args.nb31 + (iq3%args.ne33)*args.nb33);
+
+    device const char * kb = k + ikv*args.nb12 + ikv3*args.nb13;
+    device const char * vb = v + ikv*args.nb22 + ikv3*args.nb23;
+
+    for (int i = tiitg; i < R*D/4; i += NT) {
+        const int r  = i/(D/4);
+        const int c4 = i%(D/4);
+
+        half4 val = 0;
+        if (r < G) {
+            device const float4 * q4 = (device const float4 *) (q + iq1*args.nb01 + (ikv*G + r)*args.nb02 + iq3*args.nb03);
+            val = (half4) q4[c4];
+        }
+        ((threadgroup half4 *) sq)[i] = val;
+    }
+
+    for (int i = tiitg; i < 2*64; i += NT) {
+        sdiag[i] = 0.0f;
+    }
+
+    float Mr[RS];
+    float Sr[RS];
+    for (short jj = 0; jj < RS; ++jj) {
+        Mr[jj] = -FLT_MAX/2;
+        Sr[jj] = 0.0f;
+    }
+
+    simdgroup_float8x8 lo[2][NO];
+    for (short ii = 0; ii < NO; ++ii) {
+        lo[0][ii] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        lo[1][ii] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    for (int j0 = 0; j0 < args.n_kv_max_padded; j0 += C) {
+        if (tiitg < C) {
+            const int id = pidx[j0 + tiitg];
+            sid[tiitg] = id;
+            smk[tiitg] = id >= 0 ? pm[id] : (half) -MAXHALF;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // the lists are ascending with the -1 padding at the tail
+        if (sid[0] < 0) {
+            break;
+        }
+
+        for (int i = tiitg; i < C*D/8; i += NT) {
+            const int c  = i/(D/8);
+            const int d8 = i%(D/8);
+            const int id = sid[c];
+
+            uint4 val = 0;
+            if (id >= 0) {
+                val = ((device const uint4 *) (kb + (uint64_t) id*args.nb11))[d8];
+            }
+            ((threadgroup uint4 *) sk)[i] = val;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // S = Q*K^T: with 4 simdgroups, simdgroup sgitg owns the cells [8*sgitg, 8*sgitg + 8) for
+        // both row blocks; with 8, it owns one (row block, cell tile) pair
+        if (NSG == 4) {
+            simdgroup_float8x8 mqk[2] = {
+                make_filled_simdgroup_matrix<float, 8>(0.0f),
+                make_filled_simdgroup_matrix<float, 8>(0.0f),
+            };
+
+            #pragma unroll (4)
+            for (short i = 0; i < D/8; ++i) {
+                simdgroup_half8x8 mk;
+                simdgroup_half8x8 mq0;
+                simdgroup_half8x8 mq1;
+
+                simdgroup_load(mk,  sk + (8*sgitg)*D + 8*i, D, 0, true);
+                simdgroup_load(mq0, sq + 0*8*D + 8*i, D);
+                simdgroup_load(mq1, sq + 1*8*D + 8*i, D);
+
+                simdgroup_multiply_accumulate(mqk[0], mq0, mk, mqk[0]);
+                simdgroup_multiply_accumulate(mqk[1], mq1, mk, mqk[1]);
+            }
+
+            simdgroup_store(mqk[0], ss + 0*8*C + 8*sgitg, C, 0, false);
+            simdgroup_store(mqk[1], ss + 1*8*C + 8*sgitg, C, 0, false);
+        } else {
+            const short rb = sgitg/4;
+            const short ct = sgitg%4;
+
+            simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+            #pragma unroll (4)
+            for (short i = 0; i < D/8; ++i) {
+                simdgroup_half8x8 mk;
+                simdgroup_half8x8 mq;
+
+                simdgroup_load(mk, sk + (8*ct)*D + 8*i, D, 0, true);
+                simdgroup_load(mq, sq + rb*8*D + 8*i, D);
+
+                simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+            }
+
+            simdgroup_store(mqk, ss + rb*8*C + 8*ct, C, 0, false);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // stage V over K while the online softmax runs
+        for (int i = tiitg; i < C*D/8; i += NT) {
+            const int c  = i/(D/8);
+            const int d8 = i%(D/8);
+            const int id = sid[c];
+
+            uint4 val = 0;
+            if (id >= 0) {
+                val = ((device const uint4 *) (vb + (uint64_t) id*args.nb21))[d8];
+            }
+            ((threadgroup uint4 *) sk)[i] = val;
+        }
+
+        for (short jj = 0; jj < RS; ++jj) {
+            const short j = sgitg*RS + jj;
+
+            const float s = ss[j*C + tiisg]*args.scale + (float) smk[tiisg];
+            const float m = Mr[jj];
+
+            Mr[jj] = simd_max(max(m, s));
+
+            const float ms = exp(m - Mr[jj]);
+            const float p  = exp(s - Mr[jj]);
+
+            Sr[jj] = Sr[jj]*ms + simd_sum(p);
+
+            ss[j*C + tiisg] = p;
+
+            if (tiisg == 0) {
+                sms[j] = ms;
+                sdiag[(j/8)*64 + (j%8)*9] = ms;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        bool rescale = false;
+        for (short j = 0; j < R; ++j) {
+            rescale |= sms[j] != 1.0f;
+        }
+
+        if (rescale) {
+            simdgroup_float8x8 md0;
+            simdgroup_float8x8 md1;
+
+            simdgroup_load(md0, sdiag + 0,  8);
+            simdgroup_load(md1, sdiag + 64, 8);
+
+            for (short ii = 0; ii < NO; ++ii) {
+                simdgroup_multiply(lo[0][ii], md0, lo[0][ii]);
+                simdgroup_multiply(lo[1][ii], md1, lo[1][ii]);
+            }
+        }
+
+        // O = O + P*V: simdgroup sgitg owns the columns [DS*sgitg, DS*sgitg + DS)
+        FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
+            simdgroup_float8x8 vs0;
+            simdgroup_float8x8 vs1;
+
+            simdgroup_load(vs0, ss + 0*8*C + 8*cc, C);
+            simdgroup_load(vs1, ss + 1*8*C + 8*cc, C);
+
+            FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
+                simdgroup_half8x8 mv;
+
+                simdgroup_load(mv, sk + (8*cc)*D + DS*sgitg + 8*ii, D);
+
+                simdgroup_multiply_accumulate(lo[0][ii], vs0, mv, lo[0][ii]);
+                simdgroup_multiply_accumulate(lo[1][ii], vs1, mv, lo[1][ii]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // the K/V staging area holds R*D floats exactly
+    threadgroup float * so = (threadgroup float *) sk;
+
+    for (short ii = 0; ii < NO; ++ii) {
+        simdgroup_store(lo[0][ii], so + 0*8*D + DS*sgitg + 8*ii, D);
+        simdgroup_store(lo[1][ii], so + 1*8*D + DS*sgitg + 8*ii, D);
+    }
+
+    if (tiisg == 0) {
+        for (short jj = 0; jj < RS; ++jj) {
+            sms[sgitg*RS + jj] = Sr[jj];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int i = tiitg; i < G*D/4; i += NT) {
+        const int r  = i/(D/4);
+        const int c4 = i%(D/4);
+
+        const float s     = sms[r];
+        const float scale = s == 0.0f ? 0.0f : 1.0f/s;
+
+        device float4 * dst4 = (device float4 *) dst + ((uint64_t) iq3*args.ne2*args.ne1 + (ikv*G + r) + (uint64_t) iq1*args.ne1)*(D/4);
+
+        dst4[c4] = ((threadgroup float4 *) so)[r*(D/4) + c4]*scale;
+    }
+}
+
+typedef decltype(kernel_flash_attn_ext_sparse_hr<128, 4>) flash_attn_ext_sparse_hr_t;
+
+template [[host_name("kernel_flash_attn_ext_sparse_hr_d128_nsg4")]] kernel flash_attn_ext_sparse_hr_t kernel_flash_attn_ext_sparse_hr<128, 4>;
+template [[host_name("kernel_flash_attn_ext_sparse_hr_d256_nsg4")]] kernel flash_attn_ext_sparse_hr_t kernel_flash_attn_ext_sparse_hr<256, 4>;
+template [[host_name("kernel_flash_attn_ext_sparse_hr_d128_nsg8")]] kernel flash_attn_ext_sparse_hr_t kernel_flash_attn_ext_sparse_hr<128, 8>;
+template [[host_name("kernel_flash_attn_ext_sparse_hr_d256_nsg8")]] kernel flash_attn_ext_sparse_hr_t kernel_flash_attn_ext_sparse_hr<256, 8>;
+
 template<
     typename kd4x4_t,
     short nl_k,
@@ -477,3 +738,139 @@ template [[host_name("kernel_lightning_indexer_q4_1")]] kernel kernel_lightning_
 template [[host_name("kernel_lightning_indexer_q5_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_lightning_indexer_q5_1")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_lightning_indexer_q8_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q8_0, 2, dequantize_q8_0>;
+
+
+// ---------------------------------------------------------------------------------------------
+// GGML_OP_UNION_BUILD - union-8 support.
+//
+// One threadgroup per BLOCK of queries. Instead of sorting 8*n_sel ids (PLAN's bitonic + 8-way
+// merge), build a bitmap over the pooled rows. Scanning it in order yields a naturally ascending
+// union with no sort.
+//
+// Membership then needs no search either - the union index of a row is its rank in the bitmap:
+//     idx = wordbase[id/32] + popcount(bitmap[id/32] & ((1<<(id%32)) - 1))
+// and because every query that selected a row writes the SAME id there, a single atomic_or of
+// ((1<<(24+q)) | id) packs the id and the 8-bit membership mask into one word.
+//
+// max_union is block*n_sel, so the union can never overflow and no selection is ever dropped -
+// dropping one would silently change attention output.
+//
+// The bitmap is a fixed 2048 words, but n_csa is NOT bounded by it: the row space is walked in
+// chunks of 2048*32 rows, carrying the union offset across chunks. Chunks are visited in
+// increasing row order and ids ascend within a chunk, so the union stays globally ascending.
+// This is what lets the path stay on past 65536 CSA rows - it used to switch itself off there,
+// silently falling back to dense attention exactly at the long contexts it was built for.
+#define UNION_BUILD_MAX_WORDS 2048   // rows per chunk = 65536 (8 KB bitmap + 8 KB wordbase)
+
+kernel void kernel_union_build(
+        constant ggml_metal_kargs_union_build & args,
+        device const char * sel,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3 ntg3 [[threads_per_threadgroup]]) {
+    const short ntg = (short) ntg3.x;
+
+    threadgroup atomic_uint bitmap  [UNION_BUILD_MAX_WORDS];
+    threadgroup uint        wordbase[UNION_BUILD_MAX_WORDS];
+
+    // union entries emitted by the chunks already done, and whether this chunk marked anything
+    threadgroup uint         gbase;
+    threadgroup atomic_uint  hit;
+
+    const int ib = tgpig.x;
+
+    device int32_t * out = (device int32_t *) (dst + ib*args.nb1);
+
+    for (int i = tiitg; i < args.max_union + 1; i += ntg) {
+        out[i] = 0;
+    }
+
+    if (tiitg == 0) {
+        gbase = 0;
+    }
+
+    // Order device-memory zeroing before other lanes atomically OR membership into the output.
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+    const int n_this      = min((int) args.block, args.n_tokens - ib*args.block);
+    const int chunk_rows  = UNION_BUILD_MAX_WORDS*32;
+
+    for (int base = 0; base < args.n_csa; base += chunk_rows) {
+        const int rows   = min(chunk_rows, args.n_csa - base);
+        const int nwords = (rows + 31)/32;
+
+        for (int i = tiitg; i < nwords; i += ntg) {
+            atomic_store_explicit(&bitmap[i], 0u, memory_order_relaxed);
+        }
+        if (tiitg == 0) {
+            atomic_store_explicit(&hit, 0u, memory_order_relaxed);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // pass A: mark every selected row that falls in this chunk
+        for (int i = tiitg; i < n_this*args.n_sel; i += ntg) {
+            const int q = i/args.n_sel;
+            const int j = i%args.n_sel;
+
+            device const int32_t * srow = (device const int32_t *) (sel + (ib*args.block + q)*args.nbs1);
+
+            const int id = srow[j] - base;
+            if (id >= 0 && id < rows) {
+                atomic_fetch_or_explicit(&bitmap[id >> 5], 1u << (id & 31), memory_order_relaxed);
+                atomic_store_explicit(&hit, 1u, memory_order_relaxed); // every lane stores the same value
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // a chunk no query selected from contributes nothing: skip its prefix sum, which is the
+        // serial part, and its second pass over the selections
+        if (atomic_load_explicit(&hit, memory_order_relaxed) == 0u) {
+            continue;
+        }
+
+        // exclusive prefix sum of per-word popcounts, continuing from the previous chunk (serial
+        // over words in one thread; it runs once per chunk per block, against an attention op that
+        // is orders of magnitude larger)
+        if (tiitg == 0) {
+            uint acc = gbase;
+            for (int w = 0; w < nwords; ++w) {
+                wordbase[w] = acc;
+                acc += popcount(atomic_load_explicit(&bitmap[w], memory_order_relaxed));
+            }
+            gbase = acc;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // pass B: rank each selection into its union slot and OR in the membership bit
+        for (int i = tiitg; i < n_this*args.n_sel; i += ntg) {
+            const int q = i/args.n_sel;
+            const int j = i%args.n_sel;
+
+            device const int32_t * srow = (device const int32_t *) (sel + (ib*args.block + q)*args.nbs1);
+
+            const int id = srow[j] - base;
+            if (id < 0 || id >= rows) {
+                continue;
+            }
+
+            const uint w     = id >> 5;
+            const uint bit   = id & 31;
+            const uint below = atomic_load_explicit(&bitmap[w], memory_order_relaxed) & ((1u << bit) - 1u);
+            const uint idx   = wordbase[w] + popcount(below);
+
+            device atomic_uint * slot = (device atomic_uint *) &out[idx];
+            atomic_fetch_or_explicit(slot, (1u << (24 + q)) | (uint) (id + base), memory_order_relaxed);
+        }
+
+        // the next chunk rewrites bitmap and wordbase, so pass B must be done reading them
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tiitg == 0) {
+        out[args.max_union] = (int32_t) gbase;
+    }
+}

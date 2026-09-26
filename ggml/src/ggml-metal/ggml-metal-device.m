@@ -1,3 +1,4 @@
+#include <sys/mman.h>
 #import "ggml-metal-device.h"
 #import "ggml-metal-fusion.h"
 
@@ -11,6 +12,8 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <limits.h>
+#include <pthread.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -824,17 +827,406 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 }
 
 //
+// GGML_METAL_KPROF - per-segment GPU timestamps via stage-boundary counter sampling
+//
+// Apple GPUs expose only MTLCounterSamplingPointAtStageBoundary (confirmed on M1 Max), so a
+// dispatch cannot be timed directly. Each profiled segment therefore becomes its own compute pass
+// whose start/end boundaries sample the timestamp counter. Inactive unless GGML_METAL_KPROF is set.
+//
+
+#define GGML_METAL_KPROF_SEG_PER_SB   2048
+#define GGML_METAL_KPROF_MAX_SB       32
+#define GGML_METAL_KPROF_MAX_SEGMENTS (GGML_METAL_KPROF_SEG_PER_SB*GGML_METAL_KPROF_MAX_SB)
+
+// counter sample buffers are recycled rather than reallocated: a graph is encoded over (n_cb + 1)
+// command buffers every single decode step, and allocating fresh ones each time leaks address space.
+#define GGML_METAL_KPROF_MAX_FREE_SB  64
+
+struct ggml_metal_kprof_batch {
+    id<MTLCounterSampleBuffer> sb[GGML_METAL_KPROF_MAX_SB];
+    id<MTLCommandBuffer> cmd_buf;
+    uint64_t uid;
+    uint64_t key;
+    int    n_sb;
+    int  * nodes;   // raw graph node index that starts each segment
+    int    n_seg;
+    int    cap;
+    struct ggml_metal_kprof_batch * next;
+};
+
+static struct {
+    pthread_mutex_t mtx;
+    struct ggml_metal_kprof_batch * pending;
+    id<MTLCounterSampleBuffer> free_sb[GGML_METAL_KPROF_MAX_FREE_SB];
+    int  n_free_sb;
+    int  n_created_sb;
+    int  n_reused_sb;
+    int  n_failed_sb;
+    int  seq;
+    int  stride;
+} g_kprof = {
+    /*.mtx          =*/ PTHREAD_MUTEX_INITIALIZER,
+    /*.pending      =*/ NULL,
+    /*.free_sb      =*/ { nil },
+    /*.n_free_sb    =*/ 0,
+    /*.n_created_sb =*/ 0,
+    /*.n_reused_sb  =*/ 0,
+    /*.n_failed_sb  =*/ 0,
+    /*.seq          =*/ 0,
+    /*.stride       =*/ 0,
+};
+
+static pthread_once_t g_kprof_once = PTHREAD_ONCE_INIT;
+
+int ggml_metal_positive_env(const char * name) {
+    const char * value = getenv(name);
+    if (value == NULL) {
+        return 0;
+    }
+
+    char * end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed <= 0) {
+        return 0;
+    }
+
+    return parsed > INT_MAX ? INT_MAX : (int) parsed;
+}
+
+static void ggml_metal_kprof_init_once(void) {
+    g_kprof.stride = ggml_metal_positive_env("GGML_METAL_KPROF");
+}
+
+int ggml_metal_kprof_stride(void) {
+    pthread_once(&g_kprof_once, ggml_metal_kprof_init_once);
+    return g_kprof.stride;
+}
+
+static pthread_once_t g_kprof_debug_once = PTHREAD_ONCE_INIT;
+static bool g_kprof_debug = false;
+
+static void ggml_metal_kprof_debug_init_once(void) {
+    g_kprof_debug = ggml_metal_positive_env("GGML_METAL_KPROF_DEBUG") > 0;
+}
+
+static bool ggml_metal_kprof_debug(void) {
+    pthread_once(&g_kprof_debug_once, ggml_metal_kprof_debug_init_once);
+    return g_kprof_debug;
+}
+
+static uint64_t ggml_metal_kprof_hash(uint64_t h, const void * data, size_t size) {
+    const uint8_t * p = (const uint8_t *) data;
+    for (size_t i = 0; i < size; ++i) {
+        h = (h ^ p[i])*UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+uint64_t ggml_metal_kprof_graph_key(const struct ggml_cgraph * gf) {
+    uint64_t h = UINT64_C(14695981039346656037);
+    h = ggml_metal_kprof_hash(h, &gf->n_nodes, sizeof(gf->n_nodes));
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const struct ggml_tensor * node = gf->nodes[i];
+        const char * op_desc = ggml_op_desc(node);
+        const size_t op_len  = strlen(op_desc);
+        const size_t name_len = strnlen(node->name, GGML_MAX_NAME);
+
+        h = ggml_metal_kprof_hash(h, &op_len, sizeof(op_len));
+        h = ggml_metal_kprof_hash(h, op_desc, op_len);
+        h = ggml_metal_kprof_hash(h, &node->type, sizeof(node->type));
+        h = ggml_metal_kprof_hash(h, &name_len, sizeof(name_len));
+        h = ggml_metal_kprof_hash(h, node->name, name_len);
+    }
+    return h;
+}
+
+static id<MTLCounterSampleBuffer> ggml_metal_kprof_new_sb(id<MTLDevice> dev) {
+    id<MTLCounterSampleBuffer> sb = nil;
+
+    @autoreleasepool {
+        MTLCounterSampleBufferDescriptor * d = [[MTLCounterSampleBufferDescriptor alloc] init];
+
+        for (id<MTLCounterSet> cs in [dev counterSets]) {
+            if ([[cs name] isEqualToString:MTLCommonCounterSetTimestamp]) {
+                d.counterSet = cs;
+                break;
+            }
+        }
+
+        d.sampleCount = 2*GGML_METAL_KPROF_SEG_PER_SB;
+        d.storageMode = MTLStorageModeShared;
+        d.label       = @"ggml-kprof";
+
+        NSError * err = nil;
+        sb = [dev newCounterSampleBufferWithDescriptor:d error:&err];
+        if (sb == nil) {
+            fprintf(stderr, "%s: kprof: newCounterSampleBuffer failed (%s)\n", __func__,
+                    err ? [[err localizedDescription] UTF8String] : "unknown");
+        }
+
+        [d release];
+    }
+
+    return sb;
+}
+
+// caller must NOT hold g_kprof.mtx
+static id<MTLCounterSampleBuffer> ggml_metal_kprof_acquire_sb(id<MTLDevice> dev) {
+    pthread_mutex_lock(&g_kprof.mtx);
+    if (g_kprof.n_free_sb > 0) {
+        id<MTLCounterSampleBuffer> sb = g_kprof.free_sb[--g_kprof.n_free_sb];
+        g_kprof.free_sb[g_kprof.n_free_sb] = nil;
+        g_kprof.n_reused_sb++;
+        pthread_mutex_unlock(&g_kprof.mtx);
+        return sb;
+    }
+    pthread_mutex_unlock(&g_kprof.mtx);
+
+    id<MTLCounterSampleBuffer> sb = ggml_metal_kprof_new_sb(dev);
+
+    pthread_mutex_lock(&g_kprof.mtx);
+    if (sb) {
+        g_kprof.n_created_sb++;
+    } else {
+        g_kprof.n_failed_sb++;
+    }
+    pthread_mutex_unlock(&g_kprof.mtx);
+
+    return sb;
+}
+
+// caller must NOT hold g_kprof.mtx
+static void ggml_metal_kprof_recycle_sb(id<MTLCounterSampleBuffer> sb) {
+    if (sb == nil) {
+        return;
+    }
+    pthread_mutex_lock(&g_kprof.mtx);
+    if (g_kprof.n_free_sb < GGML_METAL_KPROF_MAX_FREE_SB) {
+        g_kprof.free_sb[g_kprof.n_free_sb++] = sb;
+        pthread_mutex_unlock(&g_kprof.mtx);
+        return;
+    }
+    pthread_mutex_unlock(&g_kprof.mtx);
+    [sb release];
+}
+
+//
 // MTLComputeCommandEncoder wrapper
 //
 
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+
+    // GGML_METAL_KPROF only; nil/NULL and unused when the profiler is off
+    id<MTLCommandBuffer> cmd_buf;
+    bool concurrent;
+    struct ggml_metal_kprof_batch * kprof;
 };
+
+void ggml_metal_encoder_kprof_set_graph(ggml_metal_encoder_t encoder, uint64_t uid, uint64_t key) {
+    if (encoder->kprof != NULL) {
+        encoder->kprof->uid = uid;
+        encoder->kprof->key = key;
+    }
+}
+
+// open a counter-sampled compute pass for the segment starting at `raw_node_idx`
+static void ggml_metal_encoder_kprof_begin(ggml_metal_encoder_t encoder, int raw_node_idx) {
+    struct ggml_metal_kprof_batch * b = encoder->kprof;
+
+    const int isb   = b->n_seg / GGML_METAL_KPROF_SEG_PER_SB;
+    const int islot = b->n_seg % GGML_METAL_KPROF_SEG_PER_SB;
+
+    if (b->n_seg < b->cap && islot == 0 && isb == b->n_sb) {
+        id<MTLCounterSampleBuffer> sb = ggml_metal_kprof_acquire_sb([encoder->cmd_buf device]);
+        if (sb) {
+            b->sb[b->n_sb++] = sb;
+        } else {
+            b->cap = 0;
+        }
+    }
+
+    @autoreleasepool {
+        if (b->n_seg >= b->cap || isb >= b->n_sb) {
+            // out of slots: fall back to a plain pass so encoding still completes correctly
+            if (encoder->concurrent) {
+                encoder->obj = [encoder->cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
+            } else {
+                encoder->obj = [encoder->cmd_buf computeCommandEncoder];
+            }
+            [encoder->obj retain];
+            return;
+        }
+
+        MTLComputePassDescriptor * desc = [MTLComputePassDescriptor computePassDescriptor];
+
+        desc.dispatchType = encoder->concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+
+        desc.sampleBufferAttachments[0].sampleBuffer              = b->sb[isb];
+        desc.sampleBufferAttachments[0].startOfEncoderSampleIndex = 2*islot + 0;
+        desc.sampleBufferAttachments[0].endOfEncoderSampleIndex   = 2*islot + 1;
+
+        b->nodes[b->n_seg] = raw_node_idx;
+        b->n_seg++;
+
+        encoder->obj = [encoder->cmd_buf computeCommandEncoderWithDescriptor:desc];
+        [encoder->obj retain];
+    }
+}
+
+int ggml_metal_encoder_kprof_split(ggml_metal_encoder_t encoder, int raw_node_idx) {
+    if (encoder->kprof == NULL) {
+        return -1;
+    }
+
+    [encoder->obj endEncoding];
+    [encoder->obj release];
+
+    const int seg = encoder->kprof->n_seg;
+
+    ggml_metal_encoder_kprof_begin(encoder, raw_node_idx);
+
+    return seg;
+}
+
+void ggml_metal_kprof_flush(void) {
+    if (ggml_metal_kprof_stride() == 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_kprof.mtx);
+    struct ggml_metal_kprof_batch * head = g_kprof.pending;
+    g_kprof.pending = NULL;
+    const int seq = g_kprof.seq++;
+    pthread_mutex_unlock(&g_kprof.mtx);
+
+    int ibatch = 0;
+    int ndeferred = 0;
+    struct ggml_metal_kprof_batch * deferred = NULL;
+
+    while (head != NULL) {
+        struct ggml_metal_kprof_batch * b = head;
+        head = b->next;
+
+        const MTLCommandBufferStatus status = [b->cmd_buf status];
+        if (status != MTLCommandBufferStatusCompleted && status != MTLCommandBufferStatusError) {
+            b->next = deferred;
+            deferred = b;
+            ndeferred++;
+            continue;
+        }
+
+        const int batch = ibatch++;
+
+        for (int isb = 0; isb < b->n_sb; ++isb) {
+            const int seg0  = isb*GGML_METAL_KPROF_SEG_PER_SB;
+            const int left  = b->n_seg - seg0;
+            const int nseg  = left < GGML_METAL_KPROF_SEG_PER_SB ? left : GGML_METAL_KPROF_SEG_PER_SB;
+
+            if (nseg <= 0) {
+                ggml_metal_kprof_recycle_sb(b->sb[isb]);
+                b->sb[isb] = nil;
+                continue;
+            }
+
+            @autoreleasepool {
+                NSData * data = [b->sb[isb] resolveCounterRange:NSMakeRange(0, 2*nseg)];
+
+                if (data && [data length] >= 2*(NSUInteger) nseg*sizeof(MTLCounterResultTimestamp)) {
+                    const MTLCounterResultTimestamp * ts = (const MTLCounterResultTimestamp *) [data bytes];
+
+                    for (int i = 0; i < nseg; ++i) {
+                        const uint64_t t0 = ts[2*i + 0].timestamp;
+                        const uint64_t t1 = ts[2*i + 1].timestamp;
+
+                        const char * error = NULL;
+                        if (t0 == MTLCounterErrorValue || t1 == MTLCounterErrorValue) {
+                            error = "counter timestamp unavailable";
+                        } else if (t1 < t0) {
+                            error = "counter timestamp regressed";
+                        }
+
+                        if (error != NULL) {
+                            fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"uid\":%llu,\"key\":%llu,"
+                                    "\"seg\":%d,\"node\":%d,"
+                                    "\"error\":\"%s\",\"t0\":%llu,\"t1\":%llu}\n",
+                                    seq, batch, (unsigned long long) b->uid, (unsigned long long) b->key,
+                                    seg0 + i, b->nodes[seg0 + i], error,
+                                    (unsigned long long) t0, (unsigned long long) t1);
+                            continue;
+                        }
+
+                        fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"uid\":%llu,\"key\":%llu,"
+                                "\"seg\":%d,\"node\":%d,\"t0\":%llu,\"ns\":%llu}\n",
+                                seq, batch, (unsigned long long) b->uid, (unsigned long long) b->key,
+                                seg0 + i, b->nodes[seg0 + i],
+                                (unsigned long long) t0, (unsigned long long) (t1 - t0));
+                    }
+                } else {
+                    fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"uid\":%llu,\"key\":%llu,"
+                            "\"error\":\"resolve failed\",\"sb\":%d,\"n_seg\":%d}\n",
+                            seq, batch, (unsigned long long) b->uid, (unsigned long long) b->key, isb, nseg);
+                }
+            }
+
+            ggml_metal_kprof_recycle_sb(b->sb[isb]);
+            b->sb[isb] = nil;
+        }
+
+        free(b->nodes);
+        [b->cmd_buf release];
+        free(b);
+    }
+
+    if (deferred != NULL) {
+        pthread_mutex_lock(&g_kprof.mtx);
+        struct ggml_metal_kprof_batch * tail = deferred;
+        while (tail->next != NULL) {
+            tail = tail->next;
+        }
+        tail->next = g_kprof.pending;
+        g_kprof.pending = deferred;
+        pthread_mutex_unlock(&g_kprof.mtx);
+    }
+
+    if (ggml_metal_kprof_debug()) {
+        pthread_mutex_lock(&g_kprof.mtx);
+        fprintf(stderr, "KPROFSB {\"seq\":%d,\"batches\":%d,\"deferred\":%d,\"created\":%d,"
+                "\"reused\":%d,\"failed\":%d,\"free\":%d}\n",
+                seq, ibatch, ndeferred, g_kprof.n_created_sb, g_kprof.n_reused_sb,
+                g_kprof.n_failed_sb, g_kprof.n_free_sb);
+        pthread_mutex_unlock(&g_kprof.mtx);
+    }
+}
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    res->cmd_buf    = cmd_buf;
+    res->concurrent = concurrent;
+
+    if (ggml_metal_kprof_stride() > 0) {
+        // one batch per encoder; ownership passes to g_kprof.pending in encoder_free
+        struct ggml_metal_kprof_batch * b = calloc(1, sizeof(struct ggml_metal_kprof_batch));
+        if (b != NULL) {
+            b->cap   = GGML_METAL_KPROF_MAX_SEGMENTS;
+            b->nodes = calloc(b->cap, sizeof(int));
+        }
+
+        if (b != NULL && b->nodes != NULL) {
+            b->cmd_buf = [cmd_buf retain];
+            res->kprof = b;
+
+            // the first segment starts before any node is encoded; -1 marks that prologue
+            ggml_metal_encoder_kprof_begin(res, -1);
+
+            return res;
+        }
+
+        free(b);
+    }
 
     if (concurrent) {
         res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
@@ -849,6 +1241,22 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
 
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
     [encoder->obj release];
+
+    struct ggml_metal_kprof_batch * b = encoder->kprof;
+    if (b != NULL) {
+        if (b->n_seg > 0 || b->n_sb > 0) {
+            // queue for ggml_metal_kprof_flush(), which resolves once the command buffers complete
+            pthread_mutex_lock(&g_kprof.mtx);
+            b->next = g_kprof.pending;
+            g_kprof.pending = b;
+            pthread_mutex_unlock(&g_kprof.mtx);
+        } else {
+            free(b->nodes);
+            [b->cmd_buf release];
+            free(b);
+        }
+    }
+
     free(encoder);
 }
 
@@ -897,6 +1305,183 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
 }
 
+//
+// host ops
+//
+
+#define GGML_METAL_HOST_OPS_MAX 4096
+
+struct ggml_metal_host_task {
+    uint64_t             v;
+    struct ggml_tensor * node;
+};
+
+struct ggml_metal_host_ops {
+    id<MTLSharedEvent> ev;
+
+    pthread_t       thread;
+    pthread_mutex_t mtx;
+    pthread_cond_t  cv;
+
+    struct ggml_metal_host_task tasks[GGML_METAL_HOST_OPS_MAX];
+    int  n_tasks;
+    bool stop;
+
+    uint64_t next; // next unreserved event value
+};
+
+bool ggml_metal_host_ops_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        // on by default; GGML_METAL_HOST_OPS=0 falls back to a graph split per host op
+        const char * e = getenv("GGML_METAL_HOST_OPS");
+        enabled = e == NULL || atoi(e) != 0;
+    }
+    return enabled == 1;
+}
+
+static void ggml_metal_host_task_run(struct ggml_tensor * node) {
+    if (node->op == GGML_OP_MAP_CUSTOM1) {
+        struct ggml_map_custom1_op_params p;
+        memcpy(&p, node->op_params, sizeof(p));
+        p.fun(node, node->src[0], 0, 1, p.userdata);
+    } else if (node->op == GGML_OP_MAP_CUSTOM2) {
+        struct ggml_map_custom2_op_params p;
+        memcpy(&p, node->op_params, sizeof(p));
+        p.fun(node, node->src[0], node->src[1], 0, 1, p.userdata);
+    } else {
+        GGML_ASSERT(node->op == GGML_OP_CUSTOM);
+        struct ggml_custom_op_params p;
+        memcpy(&p, node->op_params, sizeof(p));
+        p.fun(node, 0, 1, p.userdata);
+    }
+}
+
+// Waits for the GPU to signal a posted task's value, runs the task and signals the next value so the
+// GPU resumes. It spins on the event while tasks are pending: a blocking wait costs ~50 us more per
+// round trip on M1 (160 vs 208 us measured) and the GPU is idle for all of it. The GPU side only
+// waits on the event, which the host always signals, so a host-side stall never wedges the GPU.
+static void * ggml_metal_host_ops_worker(void * arg) {
+    struct ggml_metal_host_ops * hops = arg;
+
+    for (;;) {
+        pthread_mutex_lock(&hops->mtx);
+        while (hops->n_tasks == 0 && !hops->stop) {
+            pthread_cond_wait(&hops->cv, &hops->mtx);
+        }
+        if (hops->n_tasks == 0 && hops->stop) {
+            pthread_mutex_unlock(&hops->mtx);
+            break;
+        }
+        pthread_mutex_unlock(&hops->mtx);
+
+        const uint64_t s = [hops->ev signaledValue];
+
+        struct ggml_tensor * node = NULL;
+
+        pthread_mutex_lock(&hops->mtx);
+        for (int i = 0; i < hops->n_tasks; ++i) {
+            if (hops->tasks[i].v == s) {
+                node = hops->tasks[i].node;
+                hops->tasks[i] = hops->tasks[--hops->n_tasks];
+                break;
+            }
+        }
+        pthread_mutex_unlock(&hops->mtx);
+
+        if (node == NULL) {
+            __asm__ __volatile__("yield");
+            continue;
+        }
+
+        ggml_metal_host_task_run(node);
+
+        // the node's writes must be visible before the GPU resumes and reads them
+        atomic_thread_fence(memory_order_seq_cst);
+        [hops->ev setSignaledValue:s + 1];
+    }
+
+    return NULL;
+}
+
+ggml_metal_host_ops_t ggml_metal_host_ops_init(ggml_metal_device_t dev) {
+    struct ggml_metal_host_ops * hops = calloc(1, sizeof(struct ggml_metal_host_ops));
+
+    hops->ev = [(id<MTLDevice>) ggml_metal_device_get_obj(dev) newSharedEvent];
+    hops->ev.signaledValue = 0;
+    hops->next = 2;
+
+    pthread_mutex_init(&hops->mtx, NULL);
+    pthread_cond_init (&hops->cv,  NULL);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_create(&hops->thread, &attr, ggml_metal_host_ops_worker, hops);
+    pthread_attr_destroy(&attr);
+
+    GGML_LOG_INFO("%s: host ops enabled: marked custom ops run inline, without graph splits\n", __func__);
+
+    return hops;
+}
+
+void ggml_metal_host_ops_free(ggml_metal_host_ops_t hops) {
+    if (hops == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&hops->mtx);
+    hops->stop = true;
+    pthread_cond_signal(&hops->cv);
+    pthread_mutex_unlock(&hops->mtx);
+
+    pthread_join(hops->thread, NULL);
+
+    pthread_cond_destroy (&hops->cv);
+    pthread_mutex_destroy(&hops->mtx);
+
+    [hops->ev release];
+
+    free(hops);
+}
+
+uint64_t ggml_metal_host_ops_reserve(ggml_metal_host_ops_t hops, int n) {
+    pthread_mutex_lock(&hops->mtx);
+    const uint64_t base = hops->next;
+    hops->next += 2*(uint64_t) n + 2;
+    pthread_mutex_unlock(&hops->mtx);
+    return base;
+}
+
+void ggml_metal_encoder_host_op(ggml_metal_encoder_t encoder, ggml_metal_host_ops_t hops, uint64_t v, struct ggml_tensor * node) {
+    [encoder->obj endEncoding];
+    [encoder->obj release];
+
+    // posted before the signal is encoded: the GPU cannot reach it before this buffer is committed
+    pthread_mutex_lock(&hops->mtx);
+    GGML_ASSERT(hops->n_tasks < GGML_METAL_HOST_OPS_MAX);
+    hops->tasks[hops->n_tasks++] = (struct ggml_metal_host_task) { v, node };
+    pthread_cond_signal(&hops->cv);
+    pthread_mutex_unlock(&hops->mtx);
+
+    [encoder->cmd_buf encodeSignalEvent:hops->ev value:v];
+    [encoder->cmd_buf encodeWaitForEvent:hops->ev value:v + 1];
+
+    if (encoder->kprof != NULL) {
+        // the profiler times passes: continue in a new timed one (attributed like the prologue)
+        ggml_metal_encoder_kprof_begin(encoder, -1);
+        return;
+    }
+
+    if (encoder->concurrent) {
+        encoder->obj = [encoder->cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
+    } else {
+        encoder->obj = [encoder->cmd_buf computeCommandEncoder];
+    }
+
+    [encoder->obj retain];
+}
+
 struct ggml_metal_device {
     id<MTLDevice> mtl_device;
 
@@ -929,6 +1514,7 @@ struct ggml_metal_rsets {
 
     // number of seconds since the last graph computation
     // keep the residency sets wired for that amount of time to avoid being collected by the OS
+    // 0 = keep them wired for as long as the process runs
     int keep_alive_s;
     int loops_per_s;
     int time_per_loop_ms;
@@ -971,25 +1557,37 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
     res->lock = [[NSLock alloc] init];
     res->data = [[NSMutableArray alloc] init];
 
-    // by default keep the memory wired for 3 minutes
-    res->keep_alive_s = 3*60;
+    // by default keep the memory wired for as long as the process runs: once unwired, a model that
+    // fills the machine is compressed or swapped by the first memory pressure, and the next request
+    // stalls while it is faulted back. GGML_METAL_RESIDENCY_KEEP_ALIVE_S=N > 0 releases it after N
+    // idle seconds instead (upstream: 180).
+    res->keep_alive_s = 0;
 
     const char * GGML_METAL_RESIDENCY_KEEP_ALIVE_S = getenv("GGML_METAL_RESIDENCY_KEEP_ALIVE_S");
     if (GGML_METAL_RESIDENCY_KEEP_ALIVE_S) {
         res->keep_alive_s = atoi(GGML_METAL_RESIDENCY_KEEP_ALIVE_S);
     }
 
-    if (res->keep_alive_s <= 0) {
-        res->keep_alive_s = 3*60;
-    }
-
     res->time_per_loop_ms = 5;
     res->loops_per_s = 1000/res->time_per_loop_ms;
 
-    GGML_LOG_INFO("%s: creating a residency set collection (keep_alive = %d s)\n", __func__, res->keep_alive_s);
+    if (res->keep_alive_s < 0) {
+        res->keep_alive_s = 0;
+    }
+
+    // d_loop counts heartbeats
+    if (res->keep_alive_s > INT_MAX/res->loops_per_s) {
+        res->keep_alive_s = INT_MAX/res->loops_per_s;
+    }
+
+    if (res->keep_alive_s == 0) {
+        GGML_LOG_INFO("%s: creating a residency set collection (keep_alive = while running)\n", __func__);
+    } else {
+        GGML_LOG_INFO("%s: creating a residency set collection (keep_alive = %d s)\n", __func__, res->keep_alive_s);
+    }
 
     atomic_store_explicit(&res->d_stop, false, memory_order_relaxed);
-    atomic_store_explicit(&res->d_loop, res->loops_per_s*res->keep_alive_s, memory_order_relaxed);
+    atomic_store_explicit(&res->d_loop, res->keep_alive_s == 0 ? 1 : res->loops_per_s*res->keep_alive_s, memory_order_relaxed);
 
     res->d_group = dispatch_group_create();
 
@@ -1007,7 +1605,9 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
                           [res->data[i] requestResidency];
                       }
 
-                      atomic_fetch_sub_explicit(&res->d_loop, 1, memory_order_relaxed);
+                      if (res->keep_alive_s > 0) {
+                          atomic_fetch_sub_explicit(&res->d_loop, 1, memory_order_relaxed);
+                      }
 
                       [res->lock unlock];
                   }
@@ -1441,6 +2041,10 @@ void ggml_metal_device_rsets_keep_alive(ggml_metal_device_t dev) {
         return;
     }
 
+    if (dev->rsets->keep_alive_s == 0) {
+        return;
+    }
+
     atomic_store_explicit(&dev->rsets->d_loop, dev->rsets->loops_per_s*dev->rsets->keep_alive_s, memory_order_relaxed);
 }
 
@@ -1551,6 +2155,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return false;
             }
         }
+    }
+
+    // a marked host op runs on the host against shared memory, inline in the command buffer
+    if (op->op == GGML_OP_MAP_CUSTOM1 || op->op == GGML_OP_MAP_CUSTOM2 || op->op == GGML_OP_CUSTOM) {
+        return ggml_metal_host_ops_enabled() && dev->props.use_shared_buffers && ggml_map_custom_is_host_op(op);
     }
 
     switch (op->op) {
@@ -1731,23 +2340,64 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_ROLL:
             return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_FLASH_ATTN_UNION: {
+            const struct ggml_tensor * q    = op->src[0];
+            const struct ggml_tensor * k    = op->src[1];
+            const struct ggml_tensor * v    = op->src[2];
+            const struct ggml_tensor * mask = op->src[3];
+            const struct ggml_tensor * uids = op->src[4];
+            const int32_t n_dense = ggml_get_op_params_i32(op, 1);
+
+            return q && k && v && mask && uids &&
+                   q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
+                   v->type == GGML_TYPE_F16 && mask->type == GGML_TYPE_F16 &&
+                   uids->type == GGML_TYPE_I32 &&
+                   (q->ne[0] == 512 || q->ne[0] == 256) && k->ne[0] == q->ne[0] && v->ne[0] == q->ne[0] &&
+                   q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 &&
+                   k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2] &&
+                   k->ne[2] > 0 && q->ne[2] % k->ne[2] == 0 &&
+                   n_dense >= 0 && n_dense % 64 == 0 && mask->ne[0] >= MAX(n_dense, 1) &&
+                   mask->ne[1] == q->ne[1] && mask->ne[2] == 1 && mask->ne[3] == 1 &&
+                   q->nb[0] == sizeof(float) && k->nb[0] == sizeof(ggml_fp16_t) &&
+                   v->nb[0] == sizeof(ggml_fp16_t) && mask->nb[0] == sizeof(ggml_fp16_t) &&
+                   uids->nb[0] == sizeof(int32_t);
+        }
+        case GGML_OP_UNION_BUILD:
+            // The bitmap and prefix table use a fixed 16 KB, covering 65536 rows at a time; the
+            // kernel walks a larger row space in chunks of that size. The only bound left is the
+            // 24 bits the union packs a row id into, which ggml_union_build already asserts.
+            // NOTE: this check and the graph-side gate in deepseek4.cpp must agree - saying no here
+            // does not disable the path, it moves union_build to the CPU backend and adds a split.
+            return op->type == GGML_TYPE_I32 && op->src[0]->type == GGML_TYPE_I32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
+                   ggml_get_op_params_i32(op, 0) > 0 && ggml_get_op_params_i32(op, 0) <= (1 << 24) &&
+                   ggml_get_op_params_i32(op, 1) > 0 && ggml_get_op_params_i32(op, 1) <= 8;
         case GGML_OP_FLASH_ATTN_EXT:
-            // for new head sizes, add checks here
-            if (op->src[0]->ne[0] != 32 &&
-                op->src[0]->ne[0] != 40 &&
-                op->src[0]->ne[0] != 48 &&
-                op->src[0]->ne[0] != 64 &&
-                op->src[0]->ne[0] != 72 &&
-                op->src[0]->ne[0] != 80 &&
-                op->src[0]->ne[0] != 96 &&
-                op->src[0]->ne[0] != 112 &&
-                op->src[0]->ne[0] != 128 &&
-                op->src[0]->ne[0] != 192 &&
-                op->src[0]->ne[0] != 256 &&
-                op->src[0]->ne[0] != 320 &&
-                op->src[0]->ne[0] != 512 &&
-                op->src[0]->ne[0] != 576) {
-                return false;
+            {
+                // (DK, DV) pairs that have a compiled kernel; keep in sync with kernels/fa_*.metal.
+                // DK alone is not enough: an accepted DK with an uninstantiated DV resolves
+                // to a missing pipeline and aborts instead of falling back to another backend.
+                static const int dkdv[][2] = {
+                    {  32,  32 }, {  40,  40 }, {  48,  48 }, {  64,  64 },
+                    {  72,  72 }, {  80,  80 }, {  96,  64 }, {  96,  96 },
+                    { 112, 112 }, { 128, 128 }, { 192, 128 }, { 192, 192 },
+                    { 256, 256 }, { 320, 256 }, { 512, 512 }, { 576, 512 },
+                };
+
+                const int64_t dk = op->src[1]->ne[0];
+                const int64_t dv = op->src[2]->ne[0];
+
+                bool found = false;
+                for (size_t i = 0; i < sizeof(dkdv)/sizeof(dkdv[0]); ++i) {
+                    if (dk == dkdv[i][0] && dv == dkdv[i][1]) {
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (!found || op->src[0]->ne[0] != dk) {
+                    return false;
+                }
             }
             if (op->src[1]->ne[0] == 72 && op->src[1]->ne[0] != op->src[2]->ne[0]) {
                 return false;
@@ -2112,7 +2762,8 @@ static void * ggml_metal_host_malloc(size_t n) {
     return data;
 }
 
-ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared) {
+ggml_metal_buffer_t ggml_metal_buffer_init_split(ggml_metal_device_t dev, size_t size, bool shared,
+                                                 const size_t * split_offs, const size_t * split_sizes, int n_split) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 
     res->dev = dev;
@@ -2132,6 +2783,30 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     if (shared) {
         res->all_data = ggml_metal_host_malloc(size_aligned);
         res->is_shared = true;
+
+        // Ranges the caller will return to the system whole, each made its own memory object before
+        // anything wraps or touches the buffer: the kernel does not free part of an object while the
+        // rest stays mapped (measured: released that way, the pages stayed as anonymous memory).
+#if TARGET_OS_OSX
+        for (int i = 0; res->all_data != NULL && i < n_split; ++i) {
+            vm_address_t a = (vm_address_t) ((uint8_t *) res->all_data + split_offs[i]);
+            if (split_offs[i] % size_page != 0 || split_sizes[i] == 0 || split_sizes[i] % size_page != 0 ||
+                    split_offs[i] + split_sizes[i] > size_aligned ||
+                    vm_allocate((vm_map_t) mach_task_self(), &a, split_sizes[i], VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) != KERN_SUCCESS) {
+                GGML_LOG_ERROR("%s: error: cannot split range %d (offset %zu, size %zu)\n", __func__, i, split_offs[i], split_sizes[i]);
+                vm_deallocate((vm_map_t) mach_task_self(), (vm_address_t) res->all_data, size_aligned);
+                free(res);
+                return NULL;
+            }
+        }
+#else
+        if (n_split > 0) {
+            GGML_LOG_ERROR("%s: error: split allocations need vm_allocate\n", __func__);
+            free(res->all_data);
+            free(res);
+            return NULL;
+        }
+#endif
     } else {
         // use virtual address
         res->all_data = (void *) atomic_fetch_add_explicit(&dev->addr_virt, size_aligned, memory_order_relaxed);
@@ -2180,6 +2855,10 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     //ggml_metal_log_allocated_size(device, size_aligned);
 
     return res;
+}
+
+ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared) {
+    return ggml_metal_buffer_init_split(dev, size, shared, NULL, NULL, 0);
 }
 
 ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size) {
@@ -2305,6 +2984,81 @@ void * ggml_metal_buffer_get_base(ggml_metal_buffer_t buf) {
 
 bool ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf) {
     return buf->is_shared;
+}
+
+bool ggml_metal_buffer_set_views(ggml_metal_buffer_t buf, const size_t * offs, const size_t * sizes, int n) {
+    if (!buf->is_shared || !buf->owned || n <= 0 || n > GGML_METAL_MAX_BUFFERS) {
+        return false;
+    }
+
+    const size_t page = sysconf(_SC_PAGESIZE);
+    size_t end = 0;
+    for (int i = 0; i < n; ++i) {
+        if (offs[i] % page != 0 || sizes[i] == 0 || sizes[i] % page != 0 || offs[i] < end ||
+                offs[i] + sizes[i] > buf->all_size) {
+            GGML_LOG_ERROR("%s: invalid view %d: offset %zu, size %zu (buffer %zu)\n", __func__, i, offs[i], sizes[i], buf->all_size);
+            return false;
+        }
+        end = offs[i] + sizes[i];
+    }
+
+    @autoreleasepool {
+        // create every new view before touching the old ones, so a failure leaves the buffer intact
+        id<MTLBuffer> views[GGML_METAL_MAX_BUFFERS];
+        for (int i = 0; i < n; ++i) {
+            views[i] = [buf->dev->mtl_device newBufferWithBytesNoCopy:(uint8_t *) buf->all_data + offs[i]
+                                                                length:sizes[i]
+                                                               options:MTLResourceStorageModeShared
+                                                           deallocator:nil];
+            if (views[i] == nil) {
+                GGML_LOG_ERROR("%s: failed to create view %d (%zu bytes)\n", __func__, i, sizes[i]);
+                for (int j = 0; j < i; ++j) {
+                    [views[j] release];
+                }
+                return false;
+            }
+        }
+
+        struct ggml_metal_buffer_wrapper old[GGML_METAL_MAX_BUFFERS];
+        const int n_old = buf->n_buffers;
+        for (int i = 0; i < n_old; ++i) {
+            old[i] = buf->buffers[i];
+        }
+        id old_rset = buf->rset;
+        buf->rset = nil;
+
+        // register the new views first: what both cover never loses its wiring
+        for (int i = 0; i < n; ++i) {
+            buf->buffers[i].data  = (uint8_t *) buf->all_data + offs[i];
+            buf->buffers[i].size  = sizes[i];
+            buf->buffers[i].metal = views[i];
+        }
+        buf->n_buffers = n;
+        if (!ggml_metal_buffer_rset_init(buf)) {
+            // the views work without a residency set, only without its residency hint
+            GGML_LOG_WARN("%s: failed to rebuild the residency set\n", __func__);
+            buf->rset = nil;
+        }
+        ggml_metal_device_rsets_add(buf->dev, buf->rset);
+
+        // then drop the old views and their set; the driver unwires what the new views leave out
+        ggml_metal_device_rsets_rm(buf->dev, old_rset);
+#if defined(GGML_METAL_HAS_RESIDENCY_SETS)
+        if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
+            if (old_rset) {
+                [old_rset endResidency];
+                [old_rset removeAllAllocations];
+                [old_rset commit];
+                [old_rset release];
+            }
+        }
+#endif
+        for (int i = 0; i < n_old; ++i) {
+            [old[i].metal release];
+        }
+    }
+
+    return true;
 }
 
 void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {

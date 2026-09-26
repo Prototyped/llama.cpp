@@ -91,6 +91,57 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
+// host ops (on unless GGML_METAL_HOST_OPS=0): a custom node marked with ggml_map_custom_set_host_op runs
+// on a host thread while the command buffer waits on an event, so the graph needs no split for it
+typedef struct ggml_metal_host_ops * ggml_metal_host_ops_t;
+
+bool                  ggml_metal_host_ops_enabled(void);
+ggml_metal_host_ops_t ggml_metal_host_ops_init   (ggml_metal_device_t dev);
+void                  ggml_metal_host_ops_free   (ggml_metal_host_ops_t hops);
+// reserve event values for a graph of n nodes; node i signals base + 2*i + 1 and resumes at + 2
+uint64_t              ggml_metal_host_ops_reserve(ggml_metal_host_ops_t hops, int n);
+
+// end the current compute pass, signal v, wait for v + 1 and continue in a new pass
+void ggml_metal_encoder_host_op(ggml_metal_encoder_t encoder, ggml_metal_host_ops_t hops, uint64_t v, struct ggml_tensor * node);
+
+//
+// GGML_METAL_KPROF: per-kernel GPU attribution (opt-in, measurement only)
+//
+// Apple GPUs only support MTLCounterSamplingPointAtStageBoundary - verified on M1 Max, where
+// Draw/Dispatch/TileDispatch/BlitBoundary all report unsupported - so per-dispatch GPU timestamps
+// are not available. Instead, when kprof is active the encoder is split into one compute pass per
+// node (or per GGML_METAL_KPROF nodes) and each pass samples the GPU timestamp counter at its start
+// and end boundary. Splitting costs one encoder boundary per segment; sweeping the stride
+// (GGML_METAL_KPROF=1,2,4,8,...) calibrates that overhead.
+//
+// Ported from Agusx1211/llama-cpp-ds4f-m2-ultra. Measurement only: when GGML_METAL_KPROF is unset
+// every function here is a no-op and the encode path is byte-for-byte the usual one.
+//
+
+// Value of `name` when it parses as a positive integer, else 0 (unset, empty, malformed, or <= 0).
+//
+// Every opt-in switch here must go through this rather than a `getenv(...) != NULL` presence test:
+// with a presence test, `VAR=0` ENABLES the feature, which silently inverts any A/B that tries to
+// turn it off. That defect cost a real measurement in LLAMA_MOE_STREAM_PARTITION.
+int  ggml_metal_positive_env(const char * name);
+
+// non-zero when GGML_METAL_KPROF is set to a positive stride
+int  ggml_metal_kprof_stride(void);
+
+// end the current compute pass and begin a new counter-sampled one. `raw_node_idx` is the graph
+// node index that starts the new segment. no-op (returns -1) when kprof is inactive.
+int  ggml_metal_encoder_kprof_split(ggml_metal_encoder_t encoder, int raw_node_idx);
+
+// Stable key for the node map emitted by KPROF, and metadata attachment for an encoder batch.
+// The key covers each node's op, type and name but not its shape, which changes as the KV cache
+// grows, so a dumped map's ne are those of the first graph with that key.
+uint64_t ggml_metal_kprof_graph_key(const struct ggml_cgraph * gf);
+void ggml_metal_encoder_kprof_set_graph(ggml_metal_encoder_t encoder, uint64_t uid, uint64_t key);
+
+// resolve every completed segment recorded since the last flush and emit one `KPROF ` JSONL record
+// per segment on stderr. Batches whose command buffers are still running remain queued.
+void ggml_metal_kprof_flush(void);
+
 //
 // MTLLibrary wrapper
 //
@@ -108,7 +159,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline    (ggml_
 struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base              (ggml_metal_library_t lib, enum ggml_op op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst, bool contiguous);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_1d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_2d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows          (ggml_metal_library_t lib, enum ggml_type tsrc);
@@ -134,13 +185,19 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv              (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg, int chpt);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_union_build       (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_union  (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q8_0_short (ggml_metal_library_t lib, const struct ggml_tensor * op, int nr0, int nr1, int nsg);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q8_0_nr1   (ggml_metal_library_t lib, const struct ggml_tensor * op, int nr1);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_q8_0_nr0(ggml_metal_library_t lib, const struct ggml_tensor * op, int nr0);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_rows    (ggml_metal_library_t lib, const struct ggml_tensor * op, int nr0, int nsg);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax(ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax_part(ggml_metal_library_t lib);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op, bool compact, bool lo8);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort           (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -203,6 +260,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool    has_scap,
         bool    has_kvpad,
         int32_t nsg,
+        int32_t nqptg,
         bool    use_kv_f16,
         int32_t ns10,
         int32_t ns20);
@@ -210,6 +268,11 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op);
+
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_sparse_hr(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op,
+        int32_t nsg);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec(
         ggml_metal_library_t lib,
@@ -343,11 +406,17 @@ struct ggml_metal_fusion_info * ggml_metal_device_get_fusion_info(ggml_metal_dev
 typedef struct ggml_metal_buffer * ggml_metal_buffer_t;
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared);
+// as ggml_metal_buffer_init, with n_split page-aligned ranges allocated as separate memory objects (shared only)
+ggml_metal_buffer_t ggml_metal_buffer_init_split(ggml_metal_device_t dev, size_t size, bool shared,
+                                                 const size_t * split_offs, const size_t * split_sizes, int n_split);
 ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size);
 
 void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);
 bool   ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf);
+
+// see ggml_backend_metal_buffer_set_views
+bool   ggml_metal_buffer_set_views(ggml_metal_buffer_t buf, const size_t * offs, const size_t * sizes, int n);
 
 void   ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
 void   ggml_metal_buffer_set_tensor   (ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);

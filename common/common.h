@@ -374,6 +374,15 @@ struct common_params_speculative {
     double synth_len = -1.0;
     std::vector<double> synth_rates;
 
+    // Disable speculation for requests whose input prompt exceeds this length (0 = unlimited).
+    // Model-backed draft prefill can cost more than it saves for short answers at long context.
+    int32_t n_prompt_max = 0;
+
+    // Optional deterministic n-gram suffix after a complete MTP draft (server only).
+    // This extends verification, NOT the model drafter or need_n_rs_seq().
+    // Uses ngram_mod.n_match for lookup; its n_min/n_max do not apply to the suffix.
+    int32_t mtp_ngram_n_max = 0;
+
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
@@ -394,7 +403,10 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP    ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
@@ -451,6 +463,8 @@ struct common_params {
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+    int32_t n_ubatch_decode       =     0; // decode-only physical batch size (0 = fixed n_ubatch)
+    int32_t n_prompt_decode_max   =   400; // uncached prompt tails up to this stay in the decode phase (0 = always switch)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
@@ -583,6 +597,15 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
+    bool     moe_stream            = false; // stream MoE routed expert weights from disk on demand
+    uint32_t moe_stream_slots      = 0;     // expert cache slots per streamed layer (0 = auto)
+    uint64_t moe_stream_budget     = 0;     // total expert cache byte budget, used when slots == 0 (0 = auto)
+    uint32_t moe_stream_slots_decode  = 0;  // decode-phase slots per layer (0 = use budget or fixed cache)
+    uint64_t moe_stream_budget_decode = 0;  // explicit decode-phase expert cache byte budget (0 = unset)
+    bool     moe_stream_decode_auto = true; // use reclaimed workspace RAM when phase switching is enabled
+    int32_t  moe_stream_io_threads = 0;     // expert load I/O threads (<= 0 = default)
+    bool     moe_stream_direct     = false; // use O_DIRECT for expert reads (bypass page cache)
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
@@ -691,6 +714,16 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+
+    // --slot-persist: save the most recently used slot on exit and restore it on start, one file
+    // per set of weights under slot_save_path. A KV state is only valid for the exact weights
+    // that produced it, so the directory is keyed by local file identity and graph/cache settings.
+    bool slot_persist = false;
+
+    // --context-cache-path / --context-cache-slots: spill idle conversations to disk during a
+    // session instead of holding them in RAM, bounded by conversation count rather than bytes.
+    std::string context_cache_path;
+    int32_t     context_cache_slots = 0;
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

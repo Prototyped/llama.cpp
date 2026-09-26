@@ -7,7 +7,9 @@ constant short FC_mul_mm_ne12  [[function_constant(FC_MUL_MM + 2)]];
 constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
 constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
-constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
+constant bool FC_mul_mm_id_amax    [[function_constant(FC_MUL_MM + 6)]];
+constant bool FC_mul_mm_id_compact [[function_constant(FC_MUL_MM + 7)]];
+constant bool FC_mul_mm_id_lo8     [[function_constant(FC_MUL_MM + 8)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -135,7 +137,8 @@ kernel void kernel_mul_mm(
 
     // Store result tile to output matrix (with batch offset)
     // cT.store handles bounds checking via tD's extents (M, N)
-    device float * dstBatch = (device float *)dst + im * N * M;
+    // int32 im*N*M wraps for KQ [n_kv, ub, 64] past 2^31 elements (glm5next collapse)
+    device float * dstBatch = (device float *)dst + (uint64_t)im * (uint64_t)N * (uint64_t)M;
 
     auto tD = tensor(dstBatch, dextents<int32_t, 2>(M, N), array<int, 2>({1, M}));
     cT.store(tD.slice(ra, rb));
@@ -319,7 +322,7 @@ kernel void kernel_mul_mm(
         // if no bounds checks on the output are needed, we can directly write to device memory
         device float * C = (device float *) dst +
             (r0 + 32*(sgitg &  1)) + \
-            (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
+            (uint64_t)(r1 + 16*(sgitg >> 1)) * (uint64_t)args.ne0 + (uint64_t)im*(uint64_t)args.ne1*(uint64_t)args.ne0;
 
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
@@ -338,7 +341,7 @@ kernel void kernel_mul_mm(
 
         if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += NR1) {
-                device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                device float  * D  = (device float  *) dst + r0 + (uint64_t)(r1 + j)*(uint64_t)args.ne0 + (uint64_t)im*(uint64_t)args.ne1*(uint64_t)args.ne0;
                 device float4 * D4 = (device float4 *) D;
 
                 threadgroup float  * C  = temp_str + (j*NR0);
@@ -366,6 +369,7 @@ kernel void kernel_mul_mm_id_map0(
         device  const char * src2,
         device        char * htpe,
         device        char * hids,
+        device        char * htiles,
         threadgroup   char * shmem [[threadgroup(0)]],
         ushort tpitg[[thread_position_in_threadgroup]],
         ushort   ntg[[threads_per_threadgroup]]) {
@@ -412,6 +416,33 @@ kernel void kernel_mul_mm_id_map0(
 
     device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
     tpe_u32[ide] = n_all;
+
+    // the GEMM's work list: [0] = count, then (expert << 16 | tile) for every 32-token tile an expert
+    // fills, experts in order. shmem is free again: the loop above ends on a barrier.
+    threadgroup uint32_t * soff = (threadgroup uint32_t *) shmem;
+
+    const uint32_t n_tiles = (n_all + 31)/32;
+
+    soff[ide] = n_tiles;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (ide == 0) {
+        uint32_t sum = 0;
+        for (ushort i = 0; i < ntg; i++) {
+            const uint32_t n = soff[i];
+            soff[i] = sum;
+            sum += n;
+        }
+        ((device uint32_t *) htiles)[0] = sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device uint32_t * tiles = (device uint32_t *) htiles + 1 + soff[ide];
+    for (uint32_t k = 0; k < n_tiles; k++) {
+        tiles[k] = ((uint32_t) ide << 16) | k;
+    }
 }
 
 kernel void kernel_mul_mm_id_amax_part_f32(
@@ -505,6 +536,28 @@ template [[host_name("kernel_mul_mm_id_map0_ne20_10")]] kernel kernel_mul_mm_id_
 template [[host_name("kernel_mul_mm_id_map0_ne20_16")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<16>;
 template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<22>;
 
+// kernel_mul_mm_id dequantizes IQ3 blocks through its threadgroup copy of the grid, other types as usual
+template <typename block_q, typename S0_4x4, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &)>
+struct mm_id_dequantizer {
+    static void run(device const block_q * x, short il, thread S0_4x4 & reg, threadgroup const uint32_t *) {
+        dequantize_func(x, il, reg);
+    }
+};
+
+template <void (*dequantize_func)(device const block_iq3_s *, short, thread half4x4 &)>
+struct mm_id_dequantizer<block_iq3_s, half4x4, dequantize_func> {
+    static void run(device const block_iq3_s * x, short il, thread half4x4 & reg, threadgroup const uint32_t * sgrid) {
+        dequantize_iq3_s_g(x, il, reg, (threadgroup const half4 *) sgrid);
+    }
+};
+
+template <void (*dequantize_func)(device const block_iq3_xxs *, short, thread half4x4 &)>
+struct mm_id_dequantizer<block_iq3_xxs, half4x4, dequantize_func> {
+    static void run(device const block_iq3_xxs * x, short il, thread half4x4 & reg, threadgroup const uint32_t * sgrid) {
+        dequantize_iq3_xxs_g(x, il, reg, (threadgroup const half4 *) sgrid);
+    }
+};
+
 template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm_id(
         constant ggml_metal_kargs_mul_mm_id & args,
@@ -514,6 +567,7 @@ kernel void kernel_mul_mm_id(
         device const char * hids,
         device       char * dst,
         device const char * amax,
+        device const char * htiles,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -533,9 +587,25 @@ kernel void kernel_mul_mm_id(
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
 
-    const int im = tgpig.z; // expert
-    const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
+    int im; // expert
+    int r0;
+    int r1;
+    if (FC_mul_mm_id_compact) {
+        // grid (row blocks, entries of map0's list of used (expert, token tile) pairs): a tile's row
+        // blocks run back to back, so its token rows stay in cache as in the full grid
+        device const uint32_t * tiles = (device const uint32_t *) htiles;
+        if (tgpig.y >= tiles[0]) {
+            return;
+        }
+        const uint32_t t = tiles[1 + tgpig.y];
+        im = t >> 16;
+        r0 = tgpig.x*NR0;
+        r1 = (t & 0xFFFF)*NR1;
+    } else {
+        im = tgpig.z;
+        r0 = tgpig.y*NR0;
+        r1 = tgpig.x*NR1;
+    }
 
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
@@ -600,6 +670,10 @@ kernel void kernel_mul_mm_id(
 
     // simdgroups 2,3 own rows NR1H..NR1-1
     const bool sg_active = has_hi || sgitg < 2;
+
+    // sparse-routing variant (FC_mul_mm_id_lo8): a tile of at most 8 tokens gives each simdgroup 16
+    // rows of the first 8-token block instead; the plain variant compiles this path out
+    const bool lo8 = FC_mul_mm_id_lo8 && nr1 <= NR1H/2;
 #else
     auto tA  = tensor<threadgroup S0, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK, NR0));
 
@@ -614,6 +688,23 @@ kernel void kernel_mul_mm_id(
     auto cT0 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB0), float>();
     auto cT1 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB1), float>();
 #endif
+
+    // IQ3 grids in threadgroup memory: its last 2 KB are unused until the output staging after the
+    // k-loop, and threadgroup reads beat divergent constant-memory lookups (same values: bit-identical)
+    threadgroup uint32_t * sgrid = (threadgroup uint32_t *)(shmem + 6144);
+    if (is_same<block_q, block_iq3_s>::value) {
+        // 512 entries pre-expanded to half4: 4 KB, so these pipelines get 10 KB of threadgroup memory
+        for (short i = tiitg; i < 512; i += 128) {
+            ((threadgroup half4 *) sgrid)[i] = half4(as_type<uchar4>(iq3s_grid[i]));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else if (is_same<block_q, block_iq3_xxs>::value) {
+        // pre-expanded to half4 (exact: small integers), which saves unpacking the bytes per use
+        for (short i = tiitg; i < 256; i += 128) {
+            ((threadgroup half4 *) sgrid)[i] = half4(as_type<uchar4>(iq3xxs_grid[i]));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
 #ifndef GGML_METAL_HAS_TENSOR
@@ -637,7 +728,7 @@ kernel void kernel_mul_mm_id(
             }
         } else {
             S0_4x4 temp_a;
-            dequantize_func(x, il, temp_a);
+            mm_id_dequantizer<block_q, S0_4x4, dequantize_func>::run(x, il, temp_a, sgrid);
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -705,7 +796,7 @@ kernel void kernel_mul_mm_id(
             }
         } else {
             S0_4x4 temp_a;
-            dequantize_func(x, il, temp_a);
+            mm_id_dequantizer<block_q, S0_4x4, dequantize_func>::run(x, il, temp_a, sgrid);
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -755,7 +846,32 @@ kernel void kernel_mul_mm_id(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
 #ifndef GGML_METAL_HAS_TENSOR
-        if (sg_active) {
+        if (lo8) {
+            // all four simdgroups work and no MMA is spent on empty tokens; every output is still the
+            // same MMA chain, so bit-identical
+            threadgroup const S0 * lsma = (sa + 2*64*sgitg);
+            threadgroup const S1 * lsmb = sb;
+
+            FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+                simdgroup_barrier(mem_flags::mem_none);
+
+                simdgroup_load(ma[0], lsma,      8, 0, false);
+                simdgroup_load(ma[1], lsma + 64, 8, 0, false);
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                simdgroup_load(mb[0], lsmb, 8, 0, false);
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 2; i++){
+                    simdgroup_multiply_accumulate(mc[i], mb[0], ma[i], mc[i]);
+                }
+
+                lsma += 8*64;
+                lsmb += 4*64;
+            }
+        } else if (sg_active) {
             // load matrices from threadgroup memory and conduct outer products
             threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
             threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
@@ -809,7 +925,13 @@ kernel void kernel_mul_mm_id(
         cT1.store(tC1);
     }
 #else
-    if (sg_active) {
+    if (lo8) {
+        // rows 16*sgitg.., tokens 0..7
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 16*sgitg;
+
+        simdgroup_store(mc[0], temp_str,     NR0, 0, false);
+        simdgroup_store(mc[1], temp_str + 8, NR0, 0, false);
+    } else if (sg_active) {
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
 
         for (short i = 0; i < 8; i++) {

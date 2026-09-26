@@ -2,6 +2,16 @@
 #include "dequantize.h"
 #include "quantize.h"
 
+kernel void kernel_cpy_contiguous(
+        constant uint32_t & n,
+        device const uint4 * src0,
+        device       uint4 * dst,
+        uint i [[thread_position_in_grid]]) {
+    if (i < n) {
+        dst[i] = src0[i];
+    }
+}
+
 template<typename T0, typename T1>
 kernel void kernel_cpy_t_t(
         constant ggml_metal_kargs_cpy & args,
@@ -477,4 +487,3 @@ typedef decltype(kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_t
 
 template [[host_name("kernel_set_rows_f32_i64_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_tq2_0>;
 template [[host_name("kernel_set_rows_f32_i32_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int32_t, QK_K, block_tq2_0, quantize_tq2_0>;
-

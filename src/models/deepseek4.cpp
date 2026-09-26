@@ -2,9 +2,13 @@
 #include "models.h"
 
 #include "llama-kv-cache-dsv4.h"
+#include "llama-moe-stream.h"
+#include "llama-attention-union.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -758,6 +762,89 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     cb(kq_mask, "csa_lid_kq_mask", il);
 
     const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
+
+    // Union-8 shares the selected CSA rows across blocks of eight queries while preserving each
+    // query's exact membership. The upstream sparse FA path remains the fallback outside this
+    // specialized DeepSeek MLA shape.
+    static const bool union_enabled = [] {
+        const char * env = getenv("LLAMA_DSV4_UNION");
+        return env == nullptr || std::string(env) != "0";
+    }();
+    static const int64_t union_min_ncsa = [] {
+        const char * env = getenv("LLAMA_DSV4_UNION_MIN_NCSA");
+        if (env == nullptr) {
+            return (int64_t) 4096;
+        }
+
+        char * end = nullptr;
+        const int64_t value = strtoll(env, &end, 10);
+        return end != env && *end == '\0' && value >= 0 ? value : (int64_t) 4096;
+    }();
+
+    const int64_t n_stream = csa_k->ne[3];
+    const int64_t n_raw    = raw_k->ne[2];
+
+    // n_csa is no longer capped at 65536: kernel_union_build walks the row space in chunks, so the
+    // only bound left is the 24 bits the union packs an id into. The old cap turned the path off
+    // silently at exactly the contexts it was built for.
+    const bool union_ok =
+        union_enabled && sinks == nullptr && n_stream == 1 && cparams.flash_attn &&
+        top_k->ne[0] < n_csa && n_tokens >= 8 && (n_raw % 64) == 0 &&
+        n_csa >= union_min_ncsa && n_csa <= (1 << 24);
+
+    // A decline drops to dense attention, which is correct but much slower at long context, and
+    // used to leave no trace at all. Log the first one per reason so it is visible in a server log.
+    if (union_enabled && !union_ok) {
+        static uint32_t logged = 0;
+        const uint32_t reason =
+            sinks       != nullptr    ? 1u :
+            n_stream    != 1          ? 2u :
+            !cparams.flash_attn       ? 3u :
+            top_k->ne[0] >= n_csa     ? 4u :
+            n_tokens     < 8          ? 5u :
+            (n_raw % 64) != 0         ? 6u :
+            n_csa < union_min_ncsa    ? 7u : 8u;
+
+        // reasons 5 (decode) and 7 (short context) are the expected steady state, not news
+        if (reason != 5u && reason != 7u && (logged & (1u << reason)) == 0) {
+            logged |= 1u << reason;
+            LLAMA_LOG_WARN("%s: dsv4 union-8 declined (reason %u): n_csa = %" PRId64 ", top_k = %" PRId64
+                           ", n_tokens = %d, n_raw = %" PRId64 ", n_stream = %" PRId64
+                           ", fa = %d - falling back to dense attention\n",
+                    __func__, reason, n_csa, top_k->ne[0], (int) n_tokens, n_raw, n_stream,
+                    (int) cparams.flash_attn);
+        }
+    }
+
+    if (union_ok) {
+        ggml_tensor * uids = ggml_union_build(ctx0, top_k, n_csa, 8);
+        cb(uids, "csa_uids", il);
+
+        ggml_tensor * qq = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+        qq = ggml_permute(ctx0, qq, 0, 2, 1, 3);
+
+        ggml_tensor * kk = ggml_permute(ctx0, k_all, 0, 2, 1, 3);
+        if (kk->type == GGML_TYPE_F32) {
+            kk = ggml_cast(ctx0, kk, GGML_TYPE_F16);
+        }
+
+        ggml_tensor * out = llama_attention_union_masked(
+                ctx0, qq, kk, kk, kq_mask, uids, (int) n_raw, kq_scale);
+        // Top-k pads its selection with masked keys when fewer than k are visible.
+        // Preserve CSA causality as well as the raw window's mask.
+        if (llama_attention_union_supported(model.dev_layer(il), uids, out)) {
+            out = ggml_reshape_2d(ctx0, out, out->ne[0]*out->ne[1], out->ne[2]*out->ne[3]);
+
+            if (k_rot) {
+                out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+            }
+            cb(out, "attn_csa_lid", il);
+
+            return out;
+        }
+    }
+
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
@@ -1236,6 +1323,23 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
+    // The first hash_layer_count layers pick experts by token id, so their loads can start before
+    // layer 0 instead of stalling at each layer. This op is the identity on the token ids and the
+    // hash layers index tid2eid with its output, which is what orders it first.
+    ggml_tensor * hash_tokens = res->t_inp_tokens;
+    if (mstream != nullptr && hparams.dsv4_hash_layer_count > 0 && res->t_inp_tokens != nullptr &&
+            std::getenv("LLAMA_MOE_STREAM_NO_HASH_PREFETCH") == nullptr) {
+        bool any = false;
+        for (uint32_t il = 0; il < hparams.dsv4_hash_layer_count; il++) {
+            mstream->register_hash_router((int32_t) il, model.layers[il].ffn_gate_tid2eid, hparams.n_expert_used(il));
+            any = true;
+        }
+        if (any && !mstream->hash_routers.empty()) {
+            hash_tokens = ggml_map_custom1(ctx0, res->t_inp_tokens, llama_moe_stream_prefetch_hash, 1, mstream);
+            cb(hash_tokens, "moe_hash_prefetch", -1);
+        }
+    }
+
     for (int il = 0; il < n_layer; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = build_hc_mean(ctx0, inpL);
@@ -1288,7 +1392,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 exp_probs_b = layer.ffn_exp_probs_b_vl;
             }
         } else if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
-            selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, res->t_inp_tokens);
+            // hash_tokens is t_inp_tokens behind the prefetch op: identical values, but ordering the
+            // expert loads before layer 0. The media path does not take this branch, so it is unaffected.
+            selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, hash_tokens);
             exp_probs_b = nullptr;
         }
 
