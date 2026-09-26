@@ -353,6 +353,9 @@ extern "C" {
         int32_t  moe_stream_io_threads; // expert load I/O threads (<= 0 = default)
         bool     moe_stream_direct;     // use O_DIRECT for expert reads (bypass page cache); falls back if unsupported
 
+        // target for a draft head that declares nextn_shared_target_tensors; must outlive this model
+        const struct llama_model * model_shared;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
