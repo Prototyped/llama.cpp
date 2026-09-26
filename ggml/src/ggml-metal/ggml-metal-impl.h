@@ -44,7 +44,7 @@
 #define N_R0_Q8_0 2
 #define N_SG_Q8_0 4
 
-#define N_R0_MXFP4 2
+#define N_R0_MXFP4 4
 #define N_SG_MXFP4 2
 
 #define N_R0_Q2_K 4
@@ -124,6 +124,8 @@
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
 #define OP_FLASH_ATTN_EXT_NCPSG 64
+
+#define OP_FLASH_ATTN_EXT_SMEM_MAX 32768 // threadgroup memory limit on all Apple GPU families
 
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
@@ -436,6 +438,9 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  n_dense;    // union-8: size of the contiguous dense prefix
+    int32_t  max_union;  // union-8: stride of a uids row (the length lives at [max_union])
+    uint64_t nbu1;       // union-8: uids row stride in bytes
 } ggml_metal_kargs_flash_attn_ext;
 
 typedef struct {
@@ -587,6 +592,16 @@ typedef struct {
     int16_t  r2;
     int16_t  r3;
 } ggml_metal_kargs_mul_mm_id;
+
+typedef struct {
+    int32_t  n_csa;
+    int32_t  n_sel;
+    int32_t  n_tokens;
+    int32_t  block;
+    int32_t  max_union;
+    uint64_t nbs1;
+    uint64_t nb1;
+} ggml_metal_kargs_union_build;
 
 typedef struct {
     int32_t  nei0;

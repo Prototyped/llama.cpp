@@ -1677,6 +1677,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"--ubatch-size-decode"}, "N",
+        "physical maximum batch size used after prompt processing (0 = disabled; single-slot server only)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("decode physical batch size must be non-negative");
+            }
+            params.n_ubatch_decode = value;
+        }
+    ).set_env("LLAMA_ARG_UBATCH_DECODE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prompt-decode-max"}, "N",
+        string_format("with --ubatch-size-decode, process uncached prompt tails of up to N tokens at the decode "
+                      "ubatch instead of switching workspaces and migrating the expert cache (0 = always switch; default: %d)",
+                      params.n_prompt_decode_max),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("prompt decode limit must be non-negative");
+            }
+            params.n_prompt_decode_max = value;
+        }
+    ).set_env("LLAMA_ARG_PROMPT_DECODE_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {
@@ -1708,7 +1730,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.checkpoint_min_step = value;
         }
-    ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    // CLI too: llama-cli runs the same embedded server context and the same checkpoint logic, and
+    // the adjacent --ctx-checkpoints is already exposed to both. Without this, -cms is rejected by
+    // llama-cli even though the code path it controls is active there.
+    ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
@@ -2780,6 +2805,101 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
+    add_opt(common_arg(
+        {"--moe-stream"},
+        "stream Mixture of Experts (MoE) routed expert weights from disk on demand",
+        [](common_params & params) {
+            params.moe_stream = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM"));
+    add_opt(common_arg(
+        {"--moe-stream-cache"}, "<NG|Ns>",
+        "expert cache for --moe-stream: memory budget in GiB (e.g. 40) or exact slots per layer with an 's' suffix (e.g. 64s); implies --moe-stream (default: auto)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty() || !std::isdigit(static_cast<unsigned char>(value.front()))) {
+                throw std::invalid_argument("expert cache must be a non-negative size");
+            }
+            size_t pos = 0;
+            const uint64_t n = std::stoull(value, &pos);
+            std::string suffix = value.substr(pos);
+            for (auto & c : suffix) {
+                c = std::tolower(c);
+            }
+            if (suffix == "s" || suffix == "slot" || suffix == "slots") {
+                if (n >= UINT32_MAX) {
+                    throw std::invalid_argument("expert slot count is too large");
+                }
+                params.moe_stream_slots = (uint32_t) n;
+                params.moe_stream_budget = 0;
+            } else if (suffix.empty() || suffix == "g" || suffix == "gb" || suffix == "gib") {
+                if (n > UINT64_MAX / (1024ull * 1024ull * 1024ull)) {
+                    throw std::invalid_argument("expert cache budget is too large");
+                }
+                params.moe_stream_budget = n * 1024ull * 1024ull * 1024ull;
+                params.moe_stream_slots = 0;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_stream = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_CACHE"));
+    add_opt(common_arg(
+        {"--moe-stream-cache-decode"}, "<auto|NG|Ns|0>",
+        "decode expert cache: auto (default) uses reclaimed workspace RAM with migration headroom; GiB or slots set an explicit size; 0 keeps the cache fixed. Requires --ubatch-size-decode and --parallel 1",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_stream_decode_auto = true;
+                params.moe_stream_slots_decode = 0;
+                params.moe_stream_budget_decode = 0;
+                return;
+            }
+            if (value.empty() || !std::isdigit(static_cast<unsigned char>(value.front()))) {
+                throw std::invalid_argument("decode expert cache must be auto or a non-negative size");
+            }
+            size_t pos = 0;
+            const uint64_t n = std::stoull(value, &pos);
+            std::string suffix = value.substr(pos);
+            for (auto & c : suffix) {
+                c = std::tolower(c);
+            }
+            if (suffix == "s" || suffix == "slot" || suffix == "slots") {
+                if (n >= UINT32_MAX) {
+                    throw std::invalid_argument("decode expert slot count is too large");
+                }
+                params.moe_stream_slots_decode  = (uint32_t) n;
+                params.moe_stream_budget_decode = 0;
+            } else if (suffix.empty() || suffix == "g" || suffix == "gb" || suffix == "gib") {
+                if (n > UINT64_MAX / (1024ull * 1024ull * 1024ull)) {
+                    throw std::invalid_argument("decode expert cache budget is too large");
+                }
+                params.moe_stream_budget_decode = n * 1024ull * 1024ull * 1024ull;
+                params.moe_stream_slots_decode  = 0;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_stream_decode_auto = false;
+            if (n > 0) {
+                params.moe_stream = true;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_CACHE_DECODE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--moe-stream-io-threads"}, "N",
+        "I/O threads for --moe-stream expert loads; implies --moe-stream (default: auto)",
+        [](common_params & params, int value) {
+            params.moe_stream = true;
+            params.moe_stream_io_threads = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_IO_THREADS"));
+    add_opt(common_arg(
+        {"--moe-stream-direct"},
+        "use O_DIRECT for --moe-stream expert reads (bypass the page cache); implies --moe-stream. "
+        "falls back to buffered reads if O_DIRECT is unsupported by the OS or filesystem",
+        [](common_params & params) {
+            params.moe_stream = true;
+            params.moe_stream_direct = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_DIRECT"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
@@ -3873,6 +3993,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--slot-persist"},
+        "save the most recently used slot on exit and restore it on start (requires --slot-save-path).\n"
+        "with --context-cache-path the slot is saved into the context cache instead, and its most recent "
+        "entry is preloaded on start.\n"
+        "one state per set of weights: the directory is named for a hash of the model's files and settings, "
+        "so a state can never be restored into different weights",
+        [](common_params & params) {
+            params.slot_persist = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--context-cache-path"}, "PATH",
+        "spill idle conversations to this directory instead of holding them in RAM, and keep them across "
+        "restarts: the active conversation is saved on exit and every entry is indexed again on start.\n"
+        "on unified memory the RAM prompt cache competes directly with the expert cache, so a disk round "
+        "trip costs a fraction of a second against minutes of re-prefill",
+        [](common_params & params, const std::string & value) {
+            params.context_cache_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--context-cache-slots"}, "N",
+        string_format("max conversations kept in the context cache, oldest removed first (default: %d, 0 = no limit).\n"
+        "bounded by conversation count, not bytes: the natural limit is how many are live -\n"
+        "one main conversation plus a few subagents", 0),
+        [](common_params & params, int value) {
+            params.context_cache_slots = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--log-file"}, "FNAME",
         "Log to file",
         [](common_params &, const std::string & value) {
@@ -4150,6 +4300,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
     add_opt(common_arg(
+        {"--spec-mtp-ngram-n-max"}, "N",
+        "append up to N n-gram tokens after a full MTP draft (0 = disabled, max 64); uses --spec-ngram-mod-n-match, without increasing MTP depth or recurrent rollback slots",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 64) {
+                throw std::invalid_argument("MTP n-gram suffix length must be in [0, 64]");
+            }
+            params.speculative.mtp_ngram_n_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_MTP_NGRAM_N_MAX"));
+    add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",
         [](common_params & params, const std::string & value) {
@@ -4241,6 +4401,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mparams.hf_file = value; // will be used if --spec-draft-hf is set
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
+    add_opt(common_arg(
+        {"--spec-max-prompt"}, "N",
+        string_format("disable speculation for input prompts longer than N tokens (default: %d, 0 = unlimited)",
+                      params.speculative.n_prompt_max),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("spec-max-prompt must be non-negative");
+            }
+            params.speculative.n_prompt_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MAX_PROMPT"));
     add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
         string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",

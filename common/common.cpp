@@ -1461,6 +1461,13 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
+    if (params.warmup && params.moe_stream) {
+        // the warmup graph routes every token through all experts at once, which cannot fit the
+        // streaming expert cache
+        COM_TRC("%s", "skipping warmup: not supported with MoE expert streaming\n");
+        params.warmup = false;
+    }
+
     if (params.warmup) {
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
 
@@ -1553,11 +1560,17 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     tmp.push_back(0);
     tmp.push_back(0);
 
-    int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
-    if (ret != 0) {
-        COM_ERR("llama_decode() failed: %d\n", ret);
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
-        goto done;
+    // The probe still needs two positions when the caller configured a one-token batch.
+    // Let the second chunk continue from the first, just as ordinary chunked decode does.
+    for (size_t offset = 0; offset < tmp.size();) {
+        const int32_t n_tokens = (int32_t) std::min<size_t>(llama_n_batch(ctx), tmp.size() - offset);
+        int ret = llama_decode(ctx, llama_batch_get_one(tmp.data() + offset, n_tokens));
+        if (ret != 0) {
+            COM_ERR("llama_decode() failed: %d\n", ret);
+            res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+            goto done;
+        }
+        offset += n_tokens;
     }
 
     // try to remove the last tokens
@@ -1645,6 +1658,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+
+    mparams.moe_stream            = params.moe_stream;
+    mparams.moe_stream_slots      = params.moe_stream_slots;
+    mparams.moe_stream_budget     = params.moe_stream_budget;
+    mparams.moe_stream_io_threads = params.moe_stream_io_threads;
+    mparams.moe_stream_direct     = params.moe_stream_direct;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

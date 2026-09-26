@@ -23,6 +23,12 @@ ggml_metal_op_t ggml_metal_op_init(
 
 void ggml_metal_op_free(ggml_metal_op_t ctx);
 
+// GGML_METAL_KPROF: the graph's node map key, computed once by the caller
+void ggml_metal_op_set_kprof_key(ggml_metal_op_t ctx, uint64_t key);
+
+// host ops of this graph signal base + 2*node + 1 (see ggml_metal_host_ops_reserve)
+void ggml_metal_op_set_host_ops(ggml_metal_op_t ctx, ggml_metal_host_ops_t hops, uint64_t base);
+
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
@@ -37,6 +43,7 @@ size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 // id map [n_tokens, n_expert]
 size_t ggml_metal_op_mul_mat_id_extra_ids(const struct ggml_tensor * op);
 size_t ggml_metal_op_mul_mat_id_extra_amax(const struct ggml_tensor * op);
+size_t ggml_metal_op_mul_mat_id_extra_tiles(const struct ggml_tensor * op);
 
 // return true if we should use the FA vector kernel for this op
 bool ggml_metal_op_flash_attn_ext_use_vec(const struct ggml_tensor * op);
@@ -96,6 +103,8 @@ int ggml_metal_op_roll              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_arange            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_argmax            (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_union_build      (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_flash_attn_union (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_argsort           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_top_k             (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_topk_moe          (ggml_metal_op_t ctx, int idx);

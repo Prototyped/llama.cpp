@@ -100,7 +100,20 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_shared_i = {
     /* .cpy_tensor    = */ ggml_backend_metal_buffer_shared_cpy_tensor,
     /* .clear         = */ ggml_backend_metal_buffer_shared_clear,
     /* .reset         = */ NULL,
+    /* .get_host_ptr  = */ ggml_backend_metal_buffer_shared_get_base,
 };
+
+bool ggml_backend_metal_buffer_set_views(ggml_backend_buffer_t buffer, const size_t * offs, const size_t * sizes, int n) {
+    if (buffer == nullptr || buffer->iface.get_base != ggml_backend_metal_buffer_shared_get_base) {
+        return false;
+    }
+    return ggml_metal_buffer_set_views((ggml_metal_buffer_t) buffer->context, offs, sizes, n);
+}
+
+bool ggml_backend_metal_buffer_has_views(ggml_backend_buffer_t buffer) {
+    return buffer != nullptr && buffer->iface.get_base == ggml_backend_metal_buffer_shared_get_base &&
+           ggml_metal_buffer_is_shared((ggml_metal_buffer_t) buffer->context);
+}
 
 // private buffer
 
@@ -227,6 +240,7 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);
                 res += ggml_metal_op_mul_mat_id_extra_ids(tensor);
                 res += ggml_metal_op_mul_mat_id_extra_amax(tensor);
+                res += ggml_metal_op_mul_mat_id_extra_tiles(tensor);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
@@ -264,6 +278,23 @@ static const char * ggml_backend_metal_buffer_type_shared_get_name(ggml_backend_
 
 static ggml_backend_buffer_t ggml_backend_metal_buffer_type_shared_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     return ggml_backend_metal_buffer_type_alloc_buffer(buft, size, true);
+}
+
+ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_split(ggml_backend_buffer_type_t buft, size_t size,
+                                                                 const size_t * offs, const size_t * sizes, int n) {
+    if (buft == nullptr || buft->iface.alloc_buffer != ggml_backend_metal_buffer_type_shared_alloc_buffer) {
+        return nullptr;
+    }
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t) buft->device->context;
+    ggml_metal_buffer_t res = ggml_metal_buffer_init_split(ctx_dev, size, true, offs, sizes, n);
+    if (res == NULL) {
+        return nullptr;
+    }
+    if (!ggml_metal_buffer_is_shared(res)) {
+        ggml_metal_buffer_free(res);
+        return nullptr;
+    }
+    return ggml_backend_buffer_init(buft, ggml_backend_metal_buffer_shared_i, res, size);
 }
 
 static size_t ggml_backend_metal_buffer_type_shared_get_alignment(ggml_backend_buffer_type_t buft) {

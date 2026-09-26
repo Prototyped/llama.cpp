@@ -4,15 +4,22 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-phase.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-moe-stream.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -246,6 +253,7 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    phase_ubatch_max = cparams.n_ubatch;
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -272,6 +280,24 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+
+    if (model.moe_stream() && hparams.n_expert_used_max() > 0) {
+        // ubatches that touch more experts than the streaming cache holds run the expert GEMMs in
+        // multiple waves, so no ubatch size restriction is needed
+        LLAMA_LOG_INFO("%s: MoE expert streaming with %u cache slots, n_ubatch = %u\n",
+                __func__, model.moe_stream()->n_slots, cparams.n_ubatch);
+
+        // op offload snapshots host weights to the device per graph split, which assumes they do
+        // not change during the graph - streamed caches are rewritten between waves
+        bool cache_on_host = false;
+        for (const auto & group : model.moe_stream()->cache_bufs) {
+            cache_on_host = cache_on_host || (group.buf && ggml_backend_buffer_is_host(group.buf.get()));
+        }
+        if (cache_on_host && cparams.op_offload) {
+            LLAMA_LOG_WARN("%s: disabling op offload: the expert streaming cache is in host memory\n", __func__);
+            cparams.op_offload = false;
+        }
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -762,6 +788,36 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+bool llama_context::phase_capacity_valid(uint32_t n_ubatch) const {
+    return n_ubatch > 0 && n_ubatch <= phase_ubatch_max &&
+            cparams.n_seq_max == 1 && cparams.causal_attn && !model.hparams.no_alloc && !opt_ctx &&
+            (!cparams.n_rs_seq || n_ubatch > cparams.n_rs_seq + 1);
+}
+
+bool llama_context::phase_prepare(uint32_t n_ubatch) {
+    if (!phase_capacity_valid(n_ubatch)) {
+        LLAMA_LOG_ERROR("%s: invalid runtime n_ubatch %u (logical n_batch = %u)\n",
+                __func__, n_ubatch, cparams.n_batch);
+        return false;
+    }
+
+    synchronize();
+
+    // Graph results own tensor metadata that refers into the scheduler allocations. Destroy them
+    // before the scheduler so no stale graph can be reused after a phase transition.
+    for (auto & res : gf_res_prev) {
+        res.reset();
+    }
+    gf_res_prev_active = nullptr;
+    gf_res_reserve.reset();
+    sched.reset();
+
+    cparams.n_ubatch = n_ubatch;
+    sched_need_reserve = true;
+
+    return true;
 }
 
 void llama_context::synchronize() {
@@ -1422,7 +1478,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        try {
+            gf = model.build_graph(gparams);
+        } catch (const std::exception & err) {
+            // an unusable configuration (e.g. an expert cache too small to stage prefill waves)
+            // fails this ubatch; the caller reports it instead of aborting the server
+            LLAMA_LOG_ERROR("%s: failed to build the graph: %s\n", __func__, err.what());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -2408,6 +2472,18 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (n_sampling_outputs_max > 1) {
         res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
+
+    if (const auto * mstream = model.moe_stream()) {
+        // multi-pass streamed prefill adds a bounded number of extra nodes per wave per streamed layer
+        // the streaming cache is sized for the worst layer, so take the max rather than layer 0's
+        // value: upstream made n_expert_used per-layer in #28323
+        const uint32_t n_eu = model.hparams.n_expert_used_max();
+        uint32_t cap = mstream->n_slots > n_eu ? (mstream->n_slots - n_eu)/2 : 0;
+        cap = std::max<uint32_t>(cap, 1);
+        const uint32_t n_touch_max = std::min<uint32_t>(model.hparams.n_expert, n_tokens*n_eu);
+        const uint32_t n_waves = (n_touch_max + cap - 1)/cap;
+        res += 24u*n_waves*(uint32_t) mstream->layers.size();
+    }
     return res;
 }
 
@@ -2517,7 +2593,15 @@ ggml_cgraph * llama_context::graph_reserve(
 
     res->reset();
 
-    auto * gf = model.build_graph(gparams);
+    ggml_cgraph * gf = nullptr;
+    try {
+        gf = model.build_graph(gparams);
+    } catch (const std::exception & err) {
+        // same as in process_ubatch: report the configuration error, do not abort
+        LLAMA_LOG_ERROR("%s: failed to build the graph: %s\n", __func__, err.what());
+        this->n_outputs = save_n_outputs;
+        return nullptr;
+    }
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
@@ -2556,6 +2640,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.prec_policy =*/ &model.prec_policy,
+        /*.mstream     =*/ model.moe_stream(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3882,6 +3967,212 @@ uint32_t llama_n_ubatch(const llama_context * ctx) {
     return ctx->n_ubatch();
 }
 
+uint64_t llama_compute_buffer_size(const llama_context * ctx) {
+    if (ctx == nullptr || ctx->get_sched() == nullptr) {
+        return 0;
+    }
+    uint64_t result = 0;
+    for (const auto & [_, data] : ctx->memory_breakdown()) {
+        result += data.compute;
+    }
+    return result;
+}
+
+uint64_t llama_moe_stream_cache_size(const llama_model * model) {
+    const auto * stream = model ? model->moe_stream() : nullptr;
+    return stream ? stream->size_bufs() : 0;
+}
+
+uint32_t llama_moe_stream_cache_slots(const llama_model * model) {
+    const auto * stream = model ? model->moe_stream() : nullptr;
+    return stream ? stream->n_slots : 0;
+}
+
+uint32_t llama_moe_stream_slots_for_budget(
+        const llama_model * model,
+        uint64_t budget,
+        uint32_t n_slots_min) {
+    const auto * stream = model ? model->moe_stream() : nullptr;
+    return stream ? stream->slots_for_budget(budget, n_slots_min) : 0;
+}
+
+bool llama_memory_phase_transition(
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        uint32_t n_ubatch_tgt,
+        uint32_t n_ubatch_dft,
+        uint32_t moe_stream_slots) {
+    if (ctx_tgt == nullptr || !ctx_tgt->phase_capacity_valid(n_ubatch_tgt)) {
+        return false;
+    }
+    if (ctx_dft != nullptr &&
+            (!ctx_dft->phase_capacity_valid(n_ubatch_dft) || ctx_dft == ctx_tgt)) {
+        return false;
+    }
+
+    llama_moe_stream * stream = ctx_tgt->get_model().moe_stream();
+    const uint32_t old_ubatch_tgt = ctx_tgt->n_ubatch();
+    const uint32_t old_ubatch_dft = ctx_dft ? ctx_dft->n_ubatch() : 0;
+    const uint32_t old_slots = stream ? stream->n_slots : 0;
+    const bool auto_cache = moe_stream_slots == UINT32_MAX;
+    const uint64_t old_compute = llama_compute_buffer_size(ctx_tgt) + llama_compute_buffer_size(ctx_dft);
+    const uint64_t old_cache_bytes = stream ? stream->size_bufs() : 0;
+    const uint64_t safety_margin = 512ull * 1024 * 1024;
+    uint64_t reclaimed = 0;
+    uint64_t migration_headroom = 0;
+
+    if (moe_stream_slots != 0 && stream == nullptr) {
+        LLAMA_LOG_ERROR("%s: an expert-cache resize was requested without MoE streaming\n", __func__);
+        return false;
+    }
+    if (auto_cache) {
+        // CPU and Metal allocations share the RAM budget on this path. Do not sum host RAM and
+        // discrete-device VRAM and treat that number as space available for the expert cache.
+        for (const auto * ctx : {ctx_tgt, ctx_dft}) {
+            if (!ctx) {
+                continue;
+            }
+            const auto sched = ctx->get_sched();
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                const auto backend = ggml_backend_sched_get_backend(sched, i);
+                const auto buft = ggml_backend_sched_get_buffer_type(sched, backend);
+                if (!llama_memory_phase_buft_uses_system_ram(buft)) {
+                    LLAMA_LOG_ERROR("%s: automatic cache budgeting requires system RAM; unsupported compute buffer %s (backend %s)\n",
+                            __func__, buft ? ggml_backend_buft_name(buft) : "(null)", ggml_backend_name(backend));
+                    return false;
+                }
+            }
+        }
+        for (const auto & sl : stream->layers) {
+            if (sl) {
+                for (const auto & wt : sl->weights) {
+                    if (!ggml_backend_tensor_get_host_ptr(wt.cache)) {
+                        LLAMA_LOG_ERROR("%s: automatic cache budgeting requires host-visible expert buffers\n", __func__);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+    bool cache_changed = false;
+    try {
+        ctx_tgt->synchronize();
+        if (ctx_dft) {
+            ctx_dft->synchronize();
+        }
+        // Destroy every scheduler that can contain a graph referencing donor/cache tensors before
+        // rebinding those tensors. synchronize() is part of phase_prepare().
+        if (!ctx_tgt->phase_prepare(n_ubatch_tgt) ||
+                (ctx_dft && !ctx_dft->phase_prepare(n_ubatch_dft))) {
+            throw std::runtime_error("invalid phase workspace configuration");
+        }
+        const int64_t t_prep_us = ggml_time_us();
+
+        if (auto_cache) {
+            auto & memo = ctx_tgt->phase_budget;
+            const bool reuse = memo.valid && memo.dft == ctx_dft &&
+                    memo.ubatch_tgt == n_ubatch_tgt && memo.ubatch_dft == n_ubatch_dft &&
+                    memo.slots_from == old_slots && memo.compute_from == old_compute;
+            if (reuse) {
+                // Skipping the measurement also skips its reservation and the teardown that follows,
+                // so the schedulers destroyed above are rebuilt exactly once, after the resize.
+                moe_stream_slots = memo.slots;
+                stream->allocation_size(moe_stream_slots, &migration_headroom);
+                LLAMA_LOG_WARN("memory_phase_budget: reused measurement, migration_mib=%.2f cache_slots=%u->%u\n",
+                        migration_headroom/1048576.0, old_slots, moe_stream_slots);
+            } else {
+                // First measure a real small-workspace reservation. This builds graphs without
+                // evaluating tokens or changing KV, pending outputs, MTP carriers or random state.
+                ctx_tgt->sched_reserve();
+                if (ctx_dft) {
+                    ctx_dft->sched_reserve();
+                }
+                const uint64_t small_compute = llama_compute_buffer_size(ctx_tgt) + llama_compute_buffer_size(ctx_dft);
+                reclaimed = old_compute > small_compute ? old_compute - small_compute : 0;
+                moe_stream_slots = stream->slots_for_reclaimed(reclaimed, safety_margin);
+                stream->allocation_size(moe_stream_slots, &migration_headroom);
+                LLAMA_LOG_WARN("memory_phase_budget: reclaimed_mib=%.2f margin_mib=512 migration_mib=%.2f cache_slots=%u->%u\n",
+                        reclaimed/1048576.0, migration_headroom/1048576.0, old_slots, moe_stream_slots);
+                memo = { true, ctx_dft, n_ubatch_tgt, n_ubatch_dft, old_slots, old_compute, moe_stream_slots };
+                if (moe_stream_slots != old_slots) {
+                    ctx_tgt->phase_prepare(n_ubatch_tgt);
+                    if (ctx_dft) {
+                        ctx_dft->phase_prepare(n_ubatch_dft);
+                    }
+                }
+            }
+        }
+
+        const int64_t t_measure_us = ggml_time_us();
+        double t_wait_ms = 0.0;
+        if (stream && moe_stream_slots != 0 && moe_stream_slots != old_slots) {
+            if (!stream->resize_slots(moe_stream_slots)) {
+                throw std::runtime_error("expert-cache resize failed");
+            }
+            cache_changed = true;
+            t_wait_ms = stream->unwire_wait_ms;
+        }
+        const int64_t t_resize_us = ggml_time_us();
+
+        ctx_tgt->sched_reserve();
+        if (ctx_dft) {
+            ctx_dft->sched_reserve();
+        }
+        const int64_t t_reserve_us = ggml_time_us();
+        if (cache_changed) {
+        }
+
+        if (auto_cache && cache_changed) {
+            const uint64_t now_compute = llama_compute_buffer_size(ctx_tgt) + llama_compute_buffer_size(ctx_dft);
+            const uint64_t extra_cache = stream->size_bufs() - old_cache_bytes;
+            if (now_compute > old_compute || extra_cache > old_compute - now_compute ||
+                    safety_margin + migration_headroom > old_compute - now_compute - extra_cache) {
+                throw std::runtime_error("resized graph exceeded measured memory saving");
+            }
+        }
+
+        // WARN, like memory_phase_budget: this is the one line that times a transition, and INFO
+        // does not reach the server log at its default verbosity
+        LLAMA_LOG_WARN("%s: target ubatch %u -> %u, compute %.2f MiB; draft ubatch %u -> %u, compute %.2f MiB; cache %u -> %u slots; %.2f ms "
+                "(prepare %.1f, measure %.1f, resize %.1f incl. unwire wait %.1f, reserve %.1f)\n",
+                __func__, old_ubatch_tgt, n_ubatch_tgt,
+                llama_compute_buffer_size(ctx_tgt)/1024.0/1024.0,
+                old_ubatch_dft, ctx_dft ? n_ubatch_dft : 0,
+                ctx_dft ? llama_compute_buffer_size(ctx_dft)/1024.0/1024.0 : 0.0,
+                old_slots, stream ? stream->n_slots : 0,
+                (ggml_time_us() - t_start_us)/1000.0,
+                (t_prep_us - t_start_us)/1000.0, (t_measure_us - t_prep_us)/1000.0,
+                (t_resize_us - t_measure_us)/1000.0, t_wait_ms, (t_reserve_us - t_resize_us)/1000.0);
+        return true;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: transition failed: %s; restoring prior capacities\n", __func__, err.what());
+        // a reused budget may be what failed the memory check - measure again next time
+        ctx_tgt->phase_budget.valid = false;
+    }
+
+    // Best-effort transactional rollback. If the cache migration itself already restored its old
+    // layout, cache_changed is false and this only reconstructs the original schedulers.
+    try {
+        if (!ctx_tgt->phase_prepare(old_ubatch_tgt) ||
+                (ctx_dft && !ctx_dft->phase_prepare(old_ubatch_dft))) {
+            throw std::runtime_error("failed to restore workspace parameters");
+        }
+        if (cache_changed && stream && stream->n_slots != old_slots && !stream->resize_slots(old_slots)) {
+            throw std::runtime_error("failed to restore expert-cache capacity");
+        }
+        ctx_tgt->sched_reserve();
+        if (ctx_dft) {
+            ctx_dft->sched_reserve();
+        }
+    } catch (const std::exception & err) {
+        GGML_ABORT("phase transition rollback failed: %s", err.what());
+    }
+
+    return false;
+}
+
 uint32_t llama_n_seq_max(const llama_context * ctx) {
     return ctx->n_seq_max();
 }
@@ -4386,6 +4677,10 @@ void llama_perf_context_print(const llama_context * ctx) {
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+
+    if (const auto * mstream = ctx->get_model().moe_stream()) {
+        mstream->print_stats();
+    }
 }
 
 void llama_perf_context_reset(llama_context * ctx) {
